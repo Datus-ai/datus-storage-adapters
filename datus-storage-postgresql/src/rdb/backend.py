@@ -25,6 +25,7 @@ from datus.storage.rdb.base import (
     RdbTable,
     T,
     TableDefinition,
+    UniqueViolationError,
     WhereClause,
     WhereOp,
     _normalize_where,
@@ -150,7 +151,10 @@ class PgRdbTable(RdbTable):
                     return row[0]
                 return 0
         except Exception as e:
-            if "IntegrityError" in type(e).__name__ or "UniqueViolation" in type(e).__name__:
+            exc_type_name = type(e).__name__
+            if "UniqueViolation" in exc_type_name:
+                raise UniqueViolationError(str(e)) from e
+            if "IntegrityError" in exc_type_name:
                 raise IntegrityError(str(e)) from e
             raise
 
@@ -183,7 +187,10 @@ class PgRdbTable(RdbTable):
                 cursor = conn.execute(sql, params)
                 return cursor.rowcount
         except Exception as e:
-            if "IntegrityError" in type(e).__name__ or "UniqueViolation" in type(e).__name__:
+            exc_type_name = type(e).__name__
+            if "UniqueViolation" in exc_type_name:
+                raise UniqueViolationError(str(e)) from e
+            if "IntegrityError" in exc_type_name:
                 raise IntegrityError(str(e)) from e
             raise
 
@@ -217,7 +224,10 @@ class PgRdbTable(RdbTable):
             with self._auto_conn() as conn:
                 conn.execute(sql, tuple(data.values()))
         except Exception as e:
-            if "IntegrityError" in type(e).__name__ or "UniqueViolation" in type(e).__name__:
+            exc_type_name = type(e).__name__
+            if "UniqueViolation" in exc_type_name:
+                raise UniqueViolationError(str(e)) from e
+            if "IntegrityError" in exc_type_name:
                 raise IntegrityError(str(e)) from e
             raise
 
@@ -424,3 +434,4 @@ class PostgresRdbBackend(BaseRdbBackend):
             except Exception:
                 pass
         self._databases.clear()
+

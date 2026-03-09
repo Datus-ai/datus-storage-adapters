@@ -24,6 +24,12 @@ postgresql = "rdb:register"
 [project.entry-points."datus.storage.vector"]
 postgresql = "vector:register"
 
+[project.entry-points."datus.storage.rdb.testing"]
+postgresql = "rdb.testing:create_test_env"
+
+[project.entry-points."datus.storage.vector.testing"]
+postgresql = "vector.testing:create_test_env"
+
 [build-system]
 requires = ["setuptools>=80.9.0"]
 build-backend = "setuptools.build_meta"

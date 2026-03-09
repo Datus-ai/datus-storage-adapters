@@ -584,3 +584,4 @@ class PgvectorBackend(BaseVectorBackend):
             except Exception:
                 pass
         self._connections.clear()
+

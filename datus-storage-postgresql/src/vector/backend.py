@@ -9,10 +9,12 @@ Three-layer architecture:
 """
 
 import logging
+import re
 from typing import Any, Dict, List, Optional, Union
 
 import pandas as pd
 import pyarrow as pa
+from psycopg import sql as psql
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 
@@ -21,6 +23,15 @@ from datus.storage.vector.base import BaseVectorBackend, EmbeddingFunction, Vect
 from vector.schema_converter import schema_to_create_table_sql
 
 logger = logging.getLogger(__name__)
+
+_SAFE_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _validate_identifier(name: str) -> str:
+    """Validate that a name is a safe SQL identifier."""
+    if not _SAFE_IDENTIFIER.match(name):
+        raise ValueError(f"Invalid SQL identifier: {name!r}")
+    return name
 
 
 # ---------------------------------------------------------------------------
@@ -161,7 +172,7 @@ class PgVectorTable(VectorTable):
         if limit is None:
             limit = self.count_rows(where)
 
-        limit_clause = f"LIMIT {limit}" if limit else ""
+        limit_clause = f"LIMIT {int(limit)}" if limit else ""
         sql = f"SELECT {columns} FROM {self._table_name} {where_clause} {limit_clause}"
 
         with self._pool.connection() as conn:
@@ -337,11 +348,14 @@ class PgVectorTable(VectorTable):
                 return pa.table({})
             return pa.table(arrays)
 
-        col_names = select_fields or list(rows[0].keys()) if isinstance(rows[0], dict) else self._column_names
+        if isinstance(rows[0], dict):
+            col_names = select_fields or list(rows[0].keys())
+        else:
+            col_names = select_fields or self._column_names
 
         arrays = {}
-        for col in col_names:
-            values = [r[col] if isinstance(r, dict) else r for r in rows]
+        for idx, col in enumerate(col_names):
+            values = [r[col] if isinstance(r, dict) else r[idx] for r in rows]
             if col == self._vector_column:
                 parsed = []
                 for v in values:
@@ -375,13 +389,17 @@ class PgVectorDb(VectorDatabase):
         self._pool = pool
         self._config = config
         self._namespace = namespace
-        self._schema = namespace if namespace else "public"
+        self._schema = _validate_identifier(namespace) if namespace else "public"
         self._table_cache: Dict[str, PgVectorTable] = {}
 
         # Ensure schema exists for non-public namespaces
         if self._schema != "public":
             with self._pool.connection() as conn:
-                conn.execute(f"CREATE SCHEMA IF NOT EXISTS {self._schema}")
+                conn.execute(
+                    psql.SQL("CREATE SCHEMA IF NOT EXISTS {}").format(
+                        psql.Identifier(self._schema)
+                    )
+                )
                 conn.commit()
 
     @property
@@ -394,6 +412,7 @@ class PgVectorDb(VectorDatabase):
 
     def _qualified(self, table_name: str) -> str:
         """Return schema-qualified table name."""
+        _validate_identifier(table_name)
         if self._schema == "public":
             return table_name
         return f"{self._schema}.{table_name}"
@@ -499,6 +518,17 @@ class PgVectorDb(VectorDatabase):
         self._table_cache[table_name] = table
         return table
 
+    def refresh_table(
+        self,
+        table_name: str,
+        embedding_function: Optional[EmbeddingFunction] = None,
+        vector_column: str = "",
+        source_column: str = "",
+    ) -> PgVectorTable:
+        """Invalidate cache and re-open the table."""
+        self._table_cache.pop(table_name, None)
+        return self.open_table(table_name, embedding_function, vector_column, source_column)
+
     def drop_table(self, table_name: str, ignore_missing: bool = False) -> None:
         qualified = self._qualified(table_name)
         if_exists = "IF EXISTS " if ignore_missing else ""
@@ -581,7 +611,7 @@ class PgvectorBackend(BaseVectorBackend):
         for db in self._connections:
             try:
                 db.pool.close()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("Error closing vector database connection: %s", e)
         self._connections.clear()
 

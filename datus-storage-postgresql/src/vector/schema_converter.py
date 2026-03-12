@@ -17,7 +17,7 @@ _PA_TO_PG = {
     pa.uint8(): "SMALLINT",
     pa.uint16(): "INTEGER",
     pa.uint32(): "BIGINT",
-    pa.uint64(): "BIGINT",
+    pa.uint64(): "NUMERIC",
     pa.float16(): "REAL",
     pa.float32(): "REAL",
     pa.float64(): "DOUBLE PRECISION",

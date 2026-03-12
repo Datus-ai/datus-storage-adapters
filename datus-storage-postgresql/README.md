@@ -129,7 +129,7 @@ backend.initialize(config)
 db = backend.connect(namespace="my_namespace")
 
 # create_table() / open_table() return VectorTable handles
-table = db.create_table("my_table", schema=my_schema, embedding_config=emb_config)
+table = db.create_table("my_table", schema=my_schema, embedding_function=emb_config)
 table = db.open_table("my_table")
 
 # Table-level operations (no handle passing)

@@ -10,10 +10,12 @@ Three-layer architecture:
 
 import dataclasses
 import logging
+import re
 import threading
 from contextlib import contextmanager
 from typing import Any, Dict, Iterator, List, Optional, Type
 
+from psycopg import sql as psql
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 
@@ -32,6 +34,16 @@ from datus.storage.rdb.base import (
 )
 
 logger = logging.getLogger(__name__)
+
+_SAFE_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _validate_identifier(name: str) -> str:
+    """Validate that a name is a safe SQL identifier."""
+    if not _SAFE_IDENTIFIER.match(name):
+        raise ValueError(f"Invalid SQL identifier: {name!r}")
+    return name
+
 
 _PG_TYPE_MAP: Dict[str, str] = {
     "INTEGER": "INTEGER",
@@ -64,7 +76,8 @@ def _pg_col_ddl(col: ColumnDef) -> str:
             parts.append("NOT NULL")
         if col.default is not None:
             if isinstance(col.default, str):
-                parts.append(f"DEFAULT '{col.default}'")
+                escaped = col.default.replace("'", "''")
+                parts.append(f"DEFAULT '{escaped}'")
             else:
                 parts.append(f"DEFAULT {col.default}")
 
@@ -114,6 +127,7 @@ class PgRdbTable(RdbTable):
         parts = []
         params = []
         for col, op, val in conditions:
+            _validate_identifier(col)
             if op in (WhereOp.IS_NULL, WhereOp.IS_NOT_NULL):
                 parts.append(f"{col} {op.value}")
             else:
@@ -128,9 +142,11 @@ class PgRdbTable(RdbTable):
         parts = []
         for item in order_by:
             if item.startswith("-"):
-                parts.append(f"{item[1:]} DESC")
+                col = _validate_identifier(item[1:])
+                parts.append(f"{col} DESC")
             else:
-                parts.append(f"{item} ASC")
+                col = _validate_identifier(item)
+                parts.append(f"{col} ASC")
         return " ORDER BY " + ", ".join(parts)
 
     # -- CRUD --
@@ -244,13 +260,17 @@ class PgRdbDatabase(RdbDatabase):
         self._pool = pool
         self._namespace = namespace
         self._store_db_name = store_db_name
-        self._schema = namespace if namespace else "public"
+        self._schema = _validate_identifier(namespace) if namespace else "public"
         self._local = threading.local()
 
         # Ensure schema exists for non-public namespaces
         if self._schema != "public":
             with self._pool.connection() as conn:
-                conn.execute(f"CREATE SCHEMA IF NOT EXISTS {self._schema}")
+                conn.execute(
+                    psql.SQL("CREATE SCHEMA IF NOT EXISTS {}").format(
+                        psql.Identifier(self._schema)
+                    )
+                )
                 conn.commit()
 
     @property
@@ -263,6 +283,7 @@ class PgRdbDatabase(RdbDatabase):
 
     def _qualified(self, table_name: str) -> str:
         """Return schema-qualified table name."""
+        _validate_identifier(table_name)
         if self._schema == "public":
             return table_name
         return f"{self._schema}.{table_name}"
@@ -301,7 +322,7 @@ class PgRdbDatabase(RdbDatabase):
                 conn.commit()
         except Exception as e:
             ddl_text = "\n".join(ddl_statements)
-            logger.error(f"Auto-create table '{table_def.table_name}' failed: {e}")
+            logger.exception("Auto-create table '%s' failed", table_def.table_name)
             raise RuntimeError(
                 f"Failed to create table '{table_def.table_name}'. "
                 f"Please create it manually:\n\n{ddl_text}"
@@ -367,8 +388,8 @@ class PgRdbDatabase(RdbDatabase):
                 if isinstance(row, dict):
                     return next(iter(row.values()))
                 return row[0]
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("execute_insert fetchone failed: %s", e)
         return 0
 
     def param_placeholder(self) -> str:
@@ -431,7 +452,7 @@ class PostgresRdbBackend(BaseRdbBackend):
         for db in self._databases:
             try:
                 db.close()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("Error closing database: %s", e)
         self._databases.clear()
 

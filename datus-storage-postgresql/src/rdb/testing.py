@@ -53,6 +53,7 @@ class PostgresRdbTestEnv(RdbTestEnv):
             return
 
         import psycopg
+        from psycopg import sql
 
         conninfo = (
             f"host={self._config['host']} port={self._config['port']} "
@@ -61,15 +62,23 @@ class PostgresRdbTestEnv(RdbTestEnv):
         )
         with psycopg.connect(conninfo, autocommit=True) as conn:
             if namespace:
-                conn.execute(f"DROP SCHEMA IF EXISTS {namespace} CASCADE")
+                conn.execute(
+                    sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(
+                        sql.Identifier(namespace)
+                    )
+                )
             else:
                 # Drop all tables in public schema
                 rows = conn.execute(
                     "SELECT tablename FROM pg_tables WHERE schemaname = 'public'"
                 ).fetchall()
                 for row in rows:
-                    table_name = row[0] if not isinstance(row, dict) else row["tablename"]
-                    conn.execute(f"DROP TABLE IF EXISTS {table_name} CASCADE")
+                    tbl = row[0] if not isinstance(row, dict) else row["tablename"]
+                    conn.execute(
+                        sql.SQL("DROP TABLE IF EXISTS {} CASCADE").format(
+                            sql.Identifier(tbl)
+                        )
+                    )
 
     def get_config(self) -> TestEnvConfig:
         return TestEnvConfig(backend_type="postgresql", params=dict(self._config or {}))

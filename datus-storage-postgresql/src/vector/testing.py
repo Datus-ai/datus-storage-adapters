@@ -5,6 +5,7 @@ Registered as an entry point: datus.storage.vector.testing:postgresql
 """
 
 import logging
+import uuid
 from typing import Any, Dict, Optional
 
 from datus.storage.testing import TestEnvConfig, VectorTestEnv
@@ -12,41 +13,99 @@ from datus.storage.testing import TestEnvConfig, VectorTestEnv
 logger = logging.getLogger(__name__)
 
 
+class _SharedContainer:
+    """Manages a single shared PostgreSQL container across all PgvectorTestEnv instances."""
+
+    _container = None
+    _ref_count: int = 0
+    _host: Optional[str] = None
+    _port: Optional[int] = None
+
+    @classmethod
+    def acquire(cls):
+        """Start the container if not already running, increment ref count."""
+        if cls._ref_count == 0:
+            from testcontainers.postgres import PostgresContainer
+
+            cls._container = PostgresContainer(
+                image="pgvector/pgvector:pg17",
+                username="datus_test",
+                password="datus_test",
+                dbname="datus_test",
+            )
+            cls._container.start()
+            cls._host = cls._container.get_container_host_ip()
+            cls._port = int(cls._container.get_exposed_port(5432))
+            logger.info("Started shared PostgreSQL test container")
+        cls._ref_count += 1
+        return cls._host, cls._port
+
+    @classmethod
+    def release(cls):
+        """Decrement ref count; stop the container when no more users."""
+        cls._ref_count -= 1
+        if cls._ref_count <= 0:
+            cls._ref_count = 0
+            if cls._container is not None:
+                try:
+                    cls._container.stop()
+                    logger.info("Stopped shared PostgreSQL test container")
+                except Exception:
+                    pass
+                cls._container = None
+                cls._host = None
+                cls._port = None
+
+    @classmethod
+    def admin_conninfo(cls) -> str:
+        return (
+            f"host={cls._host} port={cls._port} "
+            f"user=datus_test password=datus_test dbname=datus_test"
+        )
+
+
 class PgvectorTestEnv(VectorTestEnv):
-    """VectorTestEnv implementation using a testcontainers PostgreSQL + pgvector instance."""
+    """VectorTestEnv implementation using a shared testcontainers PostgreSQL + pgvector instance.
+
+    Each instance gets its own randomly-named database for data isolation.
+    """
 
     def __init__(self):
-        self._container = None
+        self._dbname: Optional[str] = None
         self._config: Optional[Dict[str, Any]] = None
 
     def setup(self) -> None:
-        from testcontainers.postgres import PostgresContainer
+        import psycopg
 
-        self._container = PostgresContainer(
-            image="pgvector/pgvector:pg17",
-            username="datus_test",
-            password="datus_test",
-            dbname="datus_test",
-        )
-        self._container.start()
+        host, port = _SharedContainer.acquire()
+        self._dbname = "test_" + uuid.uuid4().hex[:12]
+
+        with psycopg.connect(_SharedContainer.admin_conninfo(), autocommit=True) as conn:
+            conn.execute(f"CREATE DATABASE {self._dbname}")
+
         self._config = {
-            "host": self._container.get_container_host_ip(),
-            "port": int(self._container.get_exposed_port(5432)),
+            "host": host,
+            "port": port,
             "user": "datus_test",
             "password": "datus_test",
-            "dbname": "datus_test",
+            "dbname": self._dbname,
         }
-        logger.info("Started PostgreSQL test container for vector backend")
+        logger.info("Created test database %s", self._dbname)
 
     def teardown(self) -> None:
-        if self._container is not None:
+        if self._dbname is not None:
+            import psycopg
+
             try:
-                self._container.stop()
-                logger.info("Stopped PostgreSQL test container for vector backend")
+                with psycopg.connect(_SharedContainer.admin_conninfo(), autocommit=True) as conn:
+                    conn.execute(f"DROP DATABASE IF EXISTS {self._dbname}")
+                logger.info("Dropped test database %s", self._dbname)
             except Exception:
                 pass
-            self._container = None
+            self._dbname = None
             self._config = None
+
+        _SharedContainer.release()
 
     def clear_data(self, namespace: str) -> None:
         if self._config is None:
@@ -68,7 +127,6 @@ class PgvectorTestEnv(VectorTestEnv):
                     )
                 )
             else:
-                # Drop all tables in public schema
                 rows = conn.execute(
                     "SELECT tablename FROM pg_tables WHERE schemaname = 'public'"
                 ).fetchall()

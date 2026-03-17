@@ -55,10 +55,11 @@ class _SharedContainer:
                         cls._container.stop()
                         logger.info("Stopped shared PostgreSQL test container")
                     except Exception:
-                        pass
-                    cls._container = None
-                    cls._host = None
-                    cls._port = None
+                        logger.exception("Failed to stop shared PostgreSQL test container")
+                    finally:
+                        cls._container = None
+                        cls._host = None
+                        cls._port = None
 
     @classmethod
     def admin_conninfo(cls) -> str:
@@ -107,9 +108,10 @@ class PgvectorTestEnv(VectorTestEnv):
                     conn.execute(sql.SQL("DROP DATABASE IF EXISTS {}").format(sql.Identifier(self._dbname)))
                 logger.info("Dropped test database %s", self._dbname)
             except Exception:
-                pass
-            self._dbname = None
-            self._config = None
+                logger.exception("Failed to drop test database %s", self._dbname)
+            finally:
+                self._dbname = None
+                self._config = None
 
         _SharedContainer.release()
 

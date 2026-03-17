@@ -10,7 +10,7 @@ Three-layer architecture:
 
 import logging
 import re
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import pandas as pd
 import pyarrow as pa
@@ -416,7 +416,7 @@ class PgVectorDb(VectorDatabase):
         self._config = config
         self._namespace = namespace
         self._schema = _validate_identifier(namespace) if namespace else "public"
-        self._table_cache: Dict[str, PgVectorTable] = {}
+        self._table_cache: Dict[tuple, PgVectorTable] = {}
 
         # Ensure schema exists for non-public namespaces
         if self._schema != "public":
@@ -510,7 +510,8 @@ class PgVectorDb(VectorDatabase):
             vector_dim=vector_dim,
             column_names=column_names,
         )
-        self._table_cache[table_name] = table
+        cache_key = (table_name, id(embedding_function), vector_dim, vector_column, source_column)
+        self._table_cache[cache_key] = table
         return table
 
     def open_table(
@@ -520,13 +521,17 @@ class PgVectorDb(VectorDatabase):
         vector_column: str = "",
         source_column: str = "",
     ) -> PgVectorTable:
-        if table_name in self._table_cache:
-            return self._table_cache[table_name]
-
-        qualified = self._qualified(table_name)
         vector_column = vector_column or "vector"
         source_column = source_column or "description"
         vector_dim = embedding_function.ndims() if embedding_function else 384
+
+        # Build a cache key that includes runtime options so changed options
+        # don't return a stale handle.
+        cache_key = (table_name, id(embedding_function), vector_dim, vector_column, source_column)
+        if cache_key in self._table_cache:
+            return self._table_cache[cache_key]
+
+        qualified = self._qualified(table_name)
 
         with self._pool.connection() as conn:
             rows = conn.execute(
@@ -552,8 +557,14 @@ class PgVectorDb(VectorDatabase):
             vector_dim=vector_dim,
             column_names=column_names,
         )
-        self._table_cache[table_name] = table
+        self._table_cache[cache_key] = table
         return table
+
+    def _invalidate_cache(self, table_name: str) -> None:
+        """Remove all cache entries for the given table name."""
+        keys_to_remove = [k for k in self._table_cache if k[0] == table_name]
+        for k in keys_to_remove:
+            del self._table_cache[k]
 
     def refresh_table(
         self,
@@ -563,7 +574,7 @@ class PgVectorDb(VectorDatabase):
         source_column: str = "",
     ) -> PgVectorTable:
         """Invalidate cache and re-open the table."""
-        self._table_cache.pop(table_name, None)
+        self._invalidate_cache(table_name)
         return self.open_table(table_name, embedding_function, vector_column, source_column)
 
     def drop_table(self, table_name: str, ignore_missing: bool = False) -> None:
@@ -573,7 +584,7 @@ class PgVectorDb(VectorDatabase):
         with self._pool.connection() as conn:
             conn.execute(sql)
             conn.commit()
-        self._table_cache.pop(table_name, None)
+        self._invalidate_cache(table_name)
 
 
 # ---------------------------------------------------------------------------
@@ -590,17 +601,17 @@ class PgvectorBackend(BaseVectorBackend):
     def __init__(self):
         self._config: Dict[str, Any] = {}
         self._connections: List[PgVectorDb] = []
+        self._pool: Optional[ConnectionPool] = None
 
     def initialize(self, config: Dict[str, Any]) -> None:
         self._config = config
 
-    def connect(self, namespace: str) -> PgVectorDb:
-        """Connect to PostgreSQL and return a VectorDatabase handle.
+    def _get_or_create_pool(self) -> ConnectionPool:
+        """Return the shared connection pool, creating it on first use."""
+        if self._pool is not None:
+            return self._pool
 
-        Args:
-            namespace: Logical namespace for data isolation.
-        """
-        config = dict(self._config)
+        config = self._config
 
         _REQUIRED_KEYS = ("host", "port", "user", "password", "dbname")
         missing = [k for k in _REQUIRED_KEYS if k not in config]
@@ -640,15 +651,26 @@ class PgvectorBackend(BaseVectorBackend):
                         "superuser to run: CREATE EXTENSION vector;"
                     ) from e
 
-        db = PgVectorDb(pool=pool, config=config, namespace=namespace)
+        self._pool = pool
+        return self._pool
+
+    def connect(self, namespace: str) -> PgVectorDb:
+        """Connect to PostgreSQL and return a VectorDatabase handle.
+
+        Args:
+            namespace: Logical namespace for data isolation.
+        """
+        pool = self._get_or_create_pool()
+        db = PgVectorDb(pool=pool, config=self._config, namespace=namespace)
         self._connections.append(db)
         return db
 
     def close(self) -> None:
-        for db in self._connections:
-            try:
-                db.pool.close()
-            except Exception as e:
-                logger.warning("Error closing vector database connection: %s", e)
         self._connections.clear()
+        if self._pool is not None:
+            try:
+                self._pool.close()
+            except Exception as e:
+                logger.warning("Error closing vector database connection pool: %s", e)
+            self._pool = None
 

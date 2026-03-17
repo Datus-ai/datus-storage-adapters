@@ -1,6 +1,6 @@
 # datus-storage-postgresql
 
-PostgreSQL storage adapter for [datus-agent](https://github.com/user/Datus-agent). Provides both RDB and Vector backends powered by a single PostgreSQL instance.
+PostgreSQL storage adapter for [datus-agent](https://github.com/Datus-ai/Datus-agent). Provides both RDB and Vector backends powered by a single PostgreSQL instance.
 
 ## Backends
 
@@ -29,7 +29,7 @@ Implements `BaseVectorBackend` using the [pgvector](https://github.com/pgvector/
 - **`PgVectorTable`** (table-level, implements `VectorTable`): `add()`, `merge_insert()`, `delete()`, `update()`, `search_vector()`, `search_hybrid()`, `search_all()`, `count_rows()`, index operations
 
 Features:
-- `WhereExpr` support (`str`, condition AST nodes, or `None`) via `build_where()`
+- `WhereExpr` support (condition AST nodes or `None`) via `build_where()`
 - Vector similarity search (cosine / L2 / inner product)
 - Automatic embedding computation on insert
 - HNSW vector index, B-tree scalar index, GIN full-text index

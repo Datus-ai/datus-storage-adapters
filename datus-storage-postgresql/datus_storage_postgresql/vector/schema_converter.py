@@ -94,6 +94,12 @@ def schema_to_create_table_sql(
     """
     _validate_identifier(table_name)
     unique_set = set(unique_columns) if unique_columns else set()
+    if unique_set:
+        unknown = unique_set.difference(schema.names)
+        if unknown:
+            raise ValueError(
+                f"Unknown unique_columns for table '{table_name}': {sorted(unknown)}"
+            )
     columns = schema_to_columns(schema)
     col_defs = []
     for name, pg_type in columns:

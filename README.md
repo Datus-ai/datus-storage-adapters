@@ -45,7 +45,7 @@ uv pip install -e ../Datus-agent
 
 1. Create a new package directory at the repository root (e.g. `datus-storage-mysql/`)
 2. Add its own `pyproject.toml` with dependencies and entry-points
-3. Implement `BaseRdbBackend` and/or `BaseVectorBackend` under `src/`
+3. Implement `BaseRdbBackend` and/or `BaseVectorBackend` under `datus_storage_<adapter_name>/`
 4. Register the new member in the root `pyproject.toml`:
 
 ```toml

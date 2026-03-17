@@ -62,7 +62,8 @@ def _pg_map_type(col_type: str) -> str:
 
 def _pg_col_ddl(col: ColumnDef) -> str:
     """Generate DDL fragment for a single column (PostgreSQL dialect)."""
-    parts: List[str] = [col.name]
+    col_name = _validate_identifier(col.name)
+    parts: List[str] = [col_name]
 
     if col.primary_key and col.autoincrement:
         parts.append("SERIAL PRIMARY KEY")
@@ -310,9 +311,10 @@ class PgRdbDatabase(RdbDatabase):
 
         for idx in table_def.indices:
             unique = "UNIQUE " if idx.unique else ""
-            cols = ", ".join(idx.columns)
+            idx_name = _validate_identifier(idx.name)
+            cols = ", ".join(_validate_identifier(c) for c in idx.columns)
             statements.append(
-                f"CREATE {unique}INDEX IF NOT EXISTS {idx.name} ON {qualified_name}({cols})"
+                f"CREATE {unique}INDEX IF NOT EXISTS {idx_name} ON {qualified_name}({cols})"
             )
 
         return statements
@@ -355,8 +357,8 @@ class PgRdbDatabase(RdbDatabase):
                 self._local.txn_conn = None
 
     def close(self) -> None:
-        self._pool.close()
-        logger.info("PostgreSQL RDB database connection closed")
+        # Pool is managed by the backend; database-level close is a no-op.
+        logger.info("PostgreSQL RDB database handle closed")
 
     # ========== Convenience methods ==========
 
@@ -416,6 +418,7 @@ class PostgresRdbBackend(BaseRdbBackend):
     def __init__(self):
         self._config: Dict[str, Any] = {}
         self._databases: List[PgRdbDatabase] = []
+        self._pool: Optional[ConnectionPool] = None
 
     def initialize(self, config: Dict[str, Any]) -> None:
         _REQUIRED_KEYS = ("host", "port", "user", "password", "dbname")
@@ -424,6 +427,28 @@ class PostgresRdbBackend(BaseRdbBackend):
             raise ValueError(f"Missing required PostgreSQL config keys: {', '.join(missing)}")
         self._config = config
 
+    def _get_or_create_pool(self) -> ConnectionPool:
+        """Return the shared connection pool, creating it on first use."""
+        if self._pool is None:
+            config = self._config
+            host = config["host"]
+            port = config["port"]
+            user = config["user"]
+            password = config["password"]
+            dbname = config["dbname"]
+            min_size = config.get("pool_min_size", 1)
+            max_size = config.get("pool_max_size", 10)
+
+            conninfo = f"host={host} port={port} user={user} password={password} dbname={dbname}"
+            self._pool = ConnectionPool(
+                conninfo=conninfo,
+                min_size=min_size,
+                max_size=max_size,
+                kwargs={"row_factory": dict_row},
+            )
+            logger.info("PostgreSQL connection pool created for %s:%s/%s", host, port, dbname)
+        return self._pool
+
     def connect(self, namespace: str, store_db_name: str) -> PgRdbDatabase:
         """Create a database-level handle for the given namespace/store.
 
@@ -431,33 +456,17 @@ class PostgresRdbBackend(BaseRdbBackend):
             namespace: Logical namespace mapped to a PostgreSQL schema.
             store_db_name: Logical store identifier.
         """
-        config = self._config
-        host = config["host"]
-        port = config["port"]
-        user = config["user"]
-        password = config["password"]
-        dbname = config["dbname"]
-        min_size = config.get("pool_min_size", 1)
-        max_size = config.get("pool_max_size", 10)
-
-        conninfo = f"host={host} port={port} user={user} password={password} dbname={dbname}"
-        pool = ConnectionPool(
-            conninfo=conninfo,
-            min_size=min_size,
-            max_size=max_size,
-            kwargs={"row_factory": dict_row},
-        )
-        logger.info(f"PostgreSQL connection pool created for {host}:{port}/{dbname}")
-
+        pool = self._get_or_create_pool()
         db = PgRdbDatabase(pool=pool, namespace=namespace, store_db_name=store_db_name)
         self._databases.append(db)
         return db
 
     def close(self) -> None:
-        for db in self._databases:
-            try:
-                db.close()
-            except Exception as e:
-                logger.warning("Error closing database: %s", e)
         self._databases.clear()
+        if self._pool is not None:
+            try:
+                self._pool.close()
+            except Exception as e:
+                logger.warning("Error closing connection pool: %s", e)
+            self._pool = None
 

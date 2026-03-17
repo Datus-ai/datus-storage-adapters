@@ -23,6 +23,7 @@ Main Features
 - Automatic escaping of field names and values
 - Pythonic factory helpers (eq, gt, in_, and_, or_, not_)
 - Safe handling of NULL, booleans, dates, strings
+- Wildcard: use ``*`` in ``like()`` calls (internally converted to SQL ``%``)
 
 Quick Examples
 --------------
@@ -47,7 +48,7 @@ Example 3: IN expansion
 Example 4: Using NOT
     >>> expr = and_(
     ...     not_(eq("is_blocked", True)),
-    ...     or_(like("name", "Alice%"), like("name", "%Bob%")),
+    ...     or_(like("name", "Alice*"), like("name", "*Bob*")),
     ... )
     >>> build_where(expr)
     "((NOT is_blocked = TRUE) AND (name LIKE 'Alice%' OR name LIKE '%Bob%'))"
@@ -243,12 +244,15 @@ def _compile_node(node: Node) -> str:
     raise TypeError(f"Unknown node type: {type(node)}")
 
 
-WhereExpr = Union[str, Node, None]
+WhereExpr = Union[Node, None]
 
 
 def build_where(where: WhereExpr) -> Optional[str]:
     """
     Compile a structured AST into a SQL-compatible where clause string.
+
+    Accepts only ``Node`` (Condition/And/Or/Not) or ``None``.
+    Raw strings are rejected to prevent SQL injection.
 
     Example:
         expr = And([
@@ -261,8 +265,10 @@ def build_where(where: WhereExpr) -> Optional[str]:
     if where is None:
         return None
     if isinstance(where, str):
-        stripped = where.strip()
-        return stripped or None
+        raise TypeError(
+            "Raw string where clauses are not supported due to SQL injection risk. "
+            "Use condition builders (eq, gt, in_, and_, or_, not_, like) instead."
+        )
     return _compile_node(where)
 
 

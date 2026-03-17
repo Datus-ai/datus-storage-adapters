@@ -12,6 +12,8 @@ from datus.storage.rdb.base import (
     TableDefinition,
     WhereOp,
 )
+from psycopg_pool import PoolClosed
+
 from datus_storage_postgresql.rdb.backend import PgRdbDatabase, PgRdbTable, PostgresRdbBackend
 
 
@@ -100,7 +102,8 @@ class TestBackendLifecycle:
         db1 = backend.connect(namespace="", store_db_name="store_a")
         db2 = backend.connect(namespace="", store_db_name="store_b")
         assert db1 is not db2
-        assert db1.pool is not db2.pool
+        # Multiple stores share the same connection pool
+        assert db1.pool is db2.pool
 
     def test_close_releases_all(self, pg_config):
         b = PostgresRdbBackend()
@@ -108,10 +111,10 @@ class TestBackendLifecycle:
         db1 = b.connect(namespace="", store_db_name="c1")
         db2 = b.connect(namespace="", store_db_name="c2")
         b.close()
-        with pytest.raises(Exception):
+        with pytest.raises(PoolClosed):
             with db1.get_connection():
                 pass
-        with pytest.raises(Exception):
+        with pytest.raises(PoolClosed):
             with db2.get_connection():
                 pass
 

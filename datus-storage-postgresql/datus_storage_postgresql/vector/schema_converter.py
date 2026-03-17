@@ -6,12 +6,20 @@ from typing import List, Optional, Tuple
 import pyarrow as pa
 
 _SAFE_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)?$")
+_SIMPLE_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 def _validate_identifier(name: str) -> str:
-    """Validate that a name is a safe SQL identifier."""
+    """Validate that a name is a safe SQL identifier (may be schema-qualified)."""
     if not _SAFE_IDENTIFIER.match(name):
         raise ValueError(f"Invalid SQL identifier: {name!r}")
+    return name
+
+
+def _validate_column_name(name: str) -> str:
+    """Validate that a name is a safe simple column name (no dots)."""
+    if not _SIMPLE_IDENTIFIER.match(name):
+        raise ValueError(f"Invalid column name: {name!r}")
     return name
 
 # Mapping from PyArrow types to PostgreSQL types
@@ -103,7 +111,7 @@ def schema_to_create_table_sql(
     columns = schema_to_columns(schema)
     col_defs = []
     for name, pg_type in columns:
-        _validate_identifier(name)
+        _validate_column_name(name)
         suffix = " UNIQUE" if name in unique_set else ""
         col_defs.append(f"    {name} {pg_type}{suffix}")
     return (

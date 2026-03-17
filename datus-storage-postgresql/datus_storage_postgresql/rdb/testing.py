@@ -43,11 +43,11 @@ class PostgresRdbTestEnv(RdbTestEnv):
             try:
                 self._container.stop()
                 logger.info("Stopped PostgreSQL test container for RDB backend")
-            except Exception:
-                logger.exception("Failed to stop PostgreSQL test container for RDB backend")
-            finally:
                 self._container = None
                 self._config = None
+            except Exception:
+                logger.exception("Failed to stop PostgreSQL test container for RDB backend")
+                raise
 
     def clear_data(self, namespace: str) -> None:
         if self._config is None:

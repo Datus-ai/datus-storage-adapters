@@ -154,10 +154,13 @@ class PgRdbTable(RdbTable):
 
     def insert(self, record: Any) -> int:
         data = {k: v for k, v in dataclasses.asdict(record).items() if v is not None}
-        columns = [_validate_identifier(k) for k in data.keys()]
-        placeholders = ", ".join(["%s"] * len(columns))
-        col_names = ", ".join(columns)
-        sql = f"INSERT INTO {self._qualified_name} ({col_names}) VALUES ({placeholders}) RETURNING {self._pk_column}"
+        if not data:
+            sql = f"INSERT INTO {self._qualified_name} DEFAULT VALUES RETURNING {self._pk_column}"
+        else:
+            columns = [_validate_identifier(k) for k in data.keys()]
+            placeholders = ", ".join(["%s"] * len(columns))
+            col_names = ", ".join(columns)
+            sql = f"INSERT INTO {self._qualified_name} ({col_names}) VALUES ({placeholders}) RETURNING {self._pk_column}"
         try:
             with self._auto_conn() as conn:
                 cursor = conn.execute(sql, tuple(data.values()))
@@ -225,6 +228,8 @@ class PgRdbTable(RdbTable):
 
     def upsert(self, record: Any, conflict_columns: List[str]) -> None:
         data = {k: v for k, v in dataclasses.asdict(record).items() if v is not None}
+        if not data:
+            raise ValueError("Cannot upsert a record with no non-None fields")
         columns = [_validate_identifier(k) for k in data.keys()]
         placeholders = ", ".join(["%s"] * len(columns))
         col_names = ", ".join(columns)
@@ -419,6 +424,7 @@ class PostgresRdbBackend(BaseRdbBackend):
         self._config: Dict[str, Any] = {}
         self._databases: List[PgRdbDatabase] = []
         self._pool: Optional[ConnectionPool] = None
+        self._pool_lock = threading.Lock()
 
     def initialize(self, config: Dict[str, Any]) -> None:
         _REQUIRED_KEYS = ("host", "port", "user", "password", "dbname")
@@ -429,7 +435,11 @@ class PostgresRdbBackend(BaseRdbBackend):
 
     def _get_or_create_pool(self) -> ConnectionPool:
         """Return the shared connection pool, creating it on first use."""
-        if self._pool is None:
+        if self._pool is not None:
+            return self._pool
+        with self._pool_lock:
+            if self._pool is not None:
+                return self._pool
             config = self._config
             host = config["host"]
             port = config["port"]

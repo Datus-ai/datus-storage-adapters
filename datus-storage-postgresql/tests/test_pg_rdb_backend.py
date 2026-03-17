@@ -5,7 +5,7 @@ from typing import Optional
 
 import pytest
 
-from datus.storage.rdb.base import (
+from datus_storage_base.rdb.base import (
     ColumnDef,
     IndexDef,
     IntegrityError,

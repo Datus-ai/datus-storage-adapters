@@ -9,7 +9,7 @@ help: ## Show this help
 _pkgs = $(if $(PKG),$(PKG),$(PACKAGES))
 
 build: clean ## Build packages (all or PKG=<name>)
-	@for pkg in $(_pkgs); do \
+	@set -e; for pkg in $(_pkgs); do \
 		echo "Building $$pkg..."; \
 		uv build --package $$pkg; \
 	done

@@ -86,8 +86,14 @@ class PgvectorTestEnv(VectorTestEnv):
         host, port = _SharedContainer.acquire()
         self._dbname = "test_" + uuid.uuid4().hex[:12]
 
-        with psycopg.connect(_SharedContainer.admin_conninfo(), autocommit=True) as conn:
-            conn.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(self._dbname)))
+        try:
+            with psycopg.connect(_SharedContainer.admin_conninfo(), autocommit=True) as conn:
+                conn.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(self._dbname)))
+        except Exception:
+            self._dbname = None
+            self._config = None
+            _SharedContainer.release()
+            raise
 
         self._config = {
             "host": host,

@@ -157,7 +157,7 @@ Once installed, datus-agent discovers and registers both backends automatically 
 
 ## Source Layout
 
-```
+```text
 datus_storage_postgresql/
 ├── rdb/
 │   ├── __init__.py          # register() → RdbRegistry

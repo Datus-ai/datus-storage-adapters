@@ -174,6 +174,8 @@ def _escape_value(v: Any) -> str:
     if isinstance(v, bool):
         return "TRUE" if v else "FALSE"
     if isinstance(v, (int, float)):
+        if isinstance(v, float) and (v != v or v == float("inf") or v == float("-inf")):
+            raise ValueError(f"Cannot convert {v!r} to SQL literal")
         return str(v)
     if isinstance(v, (datetime, date)):
         return f"'{v.isoformat()}'"
@@ -217,7 +219,7 @@ def _compile_condition(c: Condition) -> str:
 
     right = _escape_value(c.value)
     if op == Op.LIKE:
-        return f"{field} LIKE {right}"
+        return f"{field} LIKE {right} ESCAPE '\\'"
     if op in {Op.EQ, Op.NE, Op.GT, Op.GTE, Op.LT, Op.LTE}:
         return f"{field} {op.value} {right}"
 

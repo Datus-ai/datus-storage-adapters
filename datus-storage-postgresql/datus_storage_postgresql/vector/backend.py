@@ -10,6 +10,7 @@ Three-layer architecture:
 
 import logging
 import re
+import threading
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import pandas as pd
@@ -367,9 +368,15 @@ class PgVectorTable(VectorTable):
         """Convert fetched rows (list of dicts) to a PyArrow Table."""
         if not rows:
             if select_fields:
-                arrays = {f: pa.array([], type=pa.string()) for f in select_fields}
+                arrays = {
+                    f: pa.array([], type=pa.list_(pa.float32(), list_size=self._vector_dim) if f == self._vector_column else pa.string())
+                    for f in select_fields
+                }
             elif self._column_names:
-                arrays = {c: pa.array([], type=pa.string()) for c in self._column_names}
+                arrays = {
+                    c: pa.array([], type=pa.list_(pa.float32(), list_size=self._vector_dim) if c == self._vector_column else pa.string())
+                    for c in self._column_names
+                }
             else:
                 return pa.table({})
             return pa.table(arrays)
@@ -602,6 +609,7 @@ class PgvectorBackend(BaseVectorBackend):
         self._config: Dict[str, Any] = {}
         self._connections: List[PgVectorDb] = []
         self._pool: Optional[ConnectionPool] = None
+        self._pool_lock = threading.Lock()
 
     def initialize(self, config: Dict[str, Any]) -> None:
         self._config = config
@@ -611,47 +619,51 @@ class PgvectorBackend(BaseVectorBackend):
         if self._pool is not None:
             return self._pool
 
-        config = self._config
+        with self._pool_lock:
+            if self._pool is not None:
+                return self._pool
 
-        _REQUIRED_KEYS = ("host", "port", "user", "password", "dbname")
-        missing = [k for k in _REQUIRED_KEYS if k not in config]
-        if missing:
-            raise ValueError(f"Missing required PostgreSQL config keys: {', '.join(missing)}")
+            config = self._config
 
-        host = config["host"]
-        port = config["port"]
-        user = config["user"]
-        password = config["password"]
-        dbname = config["dbname"]
-        min_size = config.get("pool_min_size", 1)
-        max_size = config.get("pool_max_size", 10)
+            _REQUIRED_KEYS = ("host", "port", "user", "password", "dbname")
+            missing = [k for k in _REQUIRED_KEYS if k not in config]
+            if missing:
+                raise ValueError(f"Missing required PostgreSQL config keys: {', '.join(missing)}")
 
-        conninfo = f"host={host} port={port} user={user} password={password} dbname={dbname}"
-        pool = ConnectionPool(
-            conninfo=conninfo,
-            min_size=min_size,
-            max_size=max_size,
-            kwargs={"row_factory": dict_row},
-        )
+            host = config["host"]
+            port = config["port"]
+            user = config["user"]
+            password = config["password"]
+            dbname = config["dbname"]
+            min_size = config.get("pool_min_size", 1)
+            max_size = config.get("pool_max_size", 10)
 
-        # Ensure pgvector extension is available
-        with pool.connection() as conn:
-            row = conn.execute(
-                "SELECT 1 FROM pg_extension WHERE extname = 'vector'"
-            ).fetchone()
-            if not row:
-                try:
-                    conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
-                    conn.commit()
-                except Exception as e:
-                    pool.close()
-                    raise RuntimeError(
-                        "pgvector extension is not installed and current user "
-                        "lacks permission to create it. Please ask a database "
-                        "superuser to run: CREATE EXTENSION vector;"
-                    ) from e
+            conninfo = f"host={host} port={port} user={user} password={password} dbname={dbname}"
+            pool = ConnectionPool(
+                conninfo=conninfo,
+                min_size=min_size,
+                max_size=max_size,
+                kwargs={"row_factory": dict_row},
+            )
 
-        self._pool = pool
+            # Ensure pgvector extension is available
+            with pool.connection() as conn:
+                row = conn.execute(
+                    "SELECT 1 FROM pg_extension WHERE extname = 'vector'"
+                ).fetchone()
+                if not row:
+                    try:
+                        conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
+                        conn.commit()
+                    except Exception as e:
+                        pool.close()
+                        raise RuntimeError(
+                            "pgvector extension is not installed and current user "
+                            "lacks permission to create it. Please ask a database "
+                            "superuser to run: CREATE EXTENSION vector;"
+                        ) from e
+
+            self._pool = pool
         return self._pool
 
     def connect(self, namespace: str) -> PgVectorDb:

@@ -51,6 +51,7 @@ uv pip install -e ../Datus-agent
 ```toml
 [tool.uv.workspace]
 members = [
+    "datus-storage-base",
     "datus-storage-postgresql",
     "datus-storage-mysql",
 ]

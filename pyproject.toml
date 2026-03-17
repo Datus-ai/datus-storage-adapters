@@ -3,12 +3,17 @@ name = "datus-storage-adapter"
 version = "0.1.0"
 description = "Monorepo workspace for Datus storage adapter packages"
 requires-python = ">=3.12"
-
-[tool.uv.workspace]
-members = [
+dependencies = [
+    "datus-storage-base",
     "datus-storage-postgresql",
 ]
 
-[build-system]
-requires = ["setuptools>=80.9.0"]
-build-backend = "setuptools.build_meta"
+[tool.uv.sources]
+datus-storage-base = { workspace = true }
+datus-storage-postgresql = { workspace = true }
+
+[tool.uv.workspace]
+members = [
+    "datus-storage-base",
+    "datus-storage-postgresql",
+]

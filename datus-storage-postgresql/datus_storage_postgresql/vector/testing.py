@@ -8,7 +8,7 @@ import logging
 import uuid
 from typing import Any, Dict, Optional
 
-from datus.storage.testing import TestEnvConfig, VectorTestEnv
+from datus_storage_base.testing import TestEnvConfig, VectorTestEnv
 
 logger = logging.getLogger(__name__)
 

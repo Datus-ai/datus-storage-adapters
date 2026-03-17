@@ -18,9 +18,9 @@ from psycopg import sql as psql
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 
-from datus.storage.conditions import WhereExpr, build_where
-from datus.storage.vector.base import BaseVectorBackend, EmbeddingFunction, VectorDatabase, VectorTable
-from vector.schema_converter import schema_to_create_table_sql
+from datus_storage_base.conditions import WhereExpr, build_where
+from datus_storage_base.vector.base import BaseVectorBackend, EmbeddingFunction, VectorDatabase, VectorTable
+from datus_storage_postgresql.vector.schema_converter import schema_to_create_table_sql
 
 logger = logging.getLogger(__name__)
 

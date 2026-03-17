@@ -7,7 +7,7 @@ Registered as an entry point: datus.storage.rdb.testing:postgresql
 import logging
 from typing import Any, Dict, Optional
 
-from datus.storage.testing import RdbTestEnv, TestEnvConfig
+from datus_storage_base.testing import RdbTestEnv, TestEnvConfig
 
 logger = logging.getLogger(__name__)
 

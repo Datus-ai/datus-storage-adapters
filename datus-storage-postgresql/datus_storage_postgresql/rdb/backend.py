@@ -19,7 +19,7 @@ from psycopg import sql as psql
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 
-from datus.storage.rdb.base import (
+from datus_storage_base.rdb.base import (
     BaseRdbBackend,
     ColumnDef,
     IntegrityError,

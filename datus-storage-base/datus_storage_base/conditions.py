@@ -304,7 +304,9 @@ def like(field: str, pattern: str) -> Condition:
 
 
 def _replace_wildcard(value: str) -> str:
-    return value.replace("*", "%")
+    # Escape existing SQL wildcards, then convert * to %
+    escaped = value.replace("%", "\\%").replace("_", "\\_")
+    return escaped.replace("*", "%")
 
 
 # Logical helpers

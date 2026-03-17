@@ -12,7 +12,7 @@ from datus.storage.rdb.base import (
     TableDefinition,
     WhereOp,
 )
-from rdb.backend import PgRdbDatabase, PgRdbTable, PostgresRdbBackend
+from datus_storage_postgresql.rdb.backend import PgRdbDatabase, PgRdbTable, PostgresRdbBackend
 
 
 @dataclass

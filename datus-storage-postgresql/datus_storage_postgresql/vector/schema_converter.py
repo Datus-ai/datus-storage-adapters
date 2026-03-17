@@ -1,8 +1,18 @@
 """PyArrow schema to PostgreSQL DDL converter with pgvector support."""
 
+import re
 from typing import List, Optional, Tuple
 
 import pyarrow as pa
+
+_SAFE_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)?$")
+
+
+def _validate_identifier(name: str) -> str:
+    """Validate that a name is a safe SQL identifier."""
+    if not _SAFE_IDENTIFIER.match(name):
+        raise ValueError(f"Invalid SQL identifier: {name!r}")
+    return name
 
 # Mapping from PyArrow types to PostgreSQL types
 _PA_TO_PG = {
@@ -82,10 +92,12 @@ def schema_to_create_table_sql(
     Returns:
         A CREATE TABLE SQL string.
     """
+    _validate_identifier(table_name)
     unique_set = set(unique_columns) if unique_columns else set()
     columns = schema_to_columns(schema)
     col_defs = []
     for name, pg_type in columns:
+        _validate_identifier(name)
         suffix = " UNIQUE" if name in unique_set else ""
         col_defs.append(f"    {name} {pg_type}{suffix}")
     return (

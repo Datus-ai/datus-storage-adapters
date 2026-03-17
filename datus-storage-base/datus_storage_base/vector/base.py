@@ -230,7 +230,8 @@ class BaseVectorBackend(ABC):
         """Return a VectorDatabase for the given namespace.
 
         Args:
-            namespace: Logical namespace for data isolation. Must not be empty.
+            namespace: Logical namespace for data isolation. Backends may map
+                `""` to a default/public namespace when supported.
         """
 
     @abstractmethod

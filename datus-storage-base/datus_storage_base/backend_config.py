@@ -49,8 +49,11 @@ class StorageBackendConfig:
             dict(storage_config.get("vector", {})) if isinstance(storage_config.get("vector", {}), dict) else {}
         )
 
-        rdb_type = rdb_section.pop("type", "") if rdb_section else ""
-        vector_type = vector_section.pop("type", "") if vector_section else ""
+        rdb_default = RdbBackendConfig().type
+        vector_default = VectorBackendConfig().type
+
+        rdb_type = rdb_section.pop("type", rdb_default)
+        vector_type = vector_section.pop("type", vector_default)
 
         return StorageBackendConfig(
             rdb=RdbBackendConfig(type=rdb_type, params=rdb_section),

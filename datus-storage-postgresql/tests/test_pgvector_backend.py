@@ -3,9 +3,10 @@
 import pandas as pd
 import pyarrow as pa
 import pytest
+from psycopg_pool import PoolClosed
 
 from datus.storage.conditions import eq, and_, or_, not_
-from vector.backend import PgVectorDb, PgVectorTable, PgvectorBackend
+from datus_storage_postgresql.vector.backend import PgVectorDb, PgVectorTable, PgvectorBackend
 from conftest import MockEmbeddingFunction
 
 
@@ -106,7 +107,7 @@ class TestBackendLifecycle:
         b.initialize(pg_config)
         db = b.connect("")
         b.close()
-        with pytest.raises(Exception):
+        with pytest.raises(PoolClosed):
             with db.pool.connection():
                 pass
 
@@ -175,7 +176,7 @@ class TestPgVectorDb:
         db.drop_table("no_such_table_xyz", ignore_missing=True)
 
     def test_drop_table_missing_raises(self, db):
-        with pytest.raises(Exception):
+        with pytest.raises(Exception):  # psycopg.errors.UndefinedTable
             db.drop_table("no_such_table_xyz", ignore_missing=False)
 
     def test_refresh_table(self, db, table):

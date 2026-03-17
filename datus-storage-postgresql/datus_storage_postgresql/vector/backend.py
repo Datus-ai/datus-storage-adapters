@@ -200,7 +200,8 @@ class PgVectorTable(VectorTable):
 
     def create_vector_index(self, column: str, metric: str = "cosine", **kwargs) -> None:
         _validate_identifier(column)
-        index_name = f"idx_{self._table_name}_{column}_hnsw"
+        table_token = self._table_name.rsplit(".", 1)[-1]
+        index_name = f"idx_{table_token}_{column}_hnsw"
         ops_map = {
             "cosine": "vector_cosine_ops",
             "l2": "vector_l2_ops",
@@ -225,7 +226,8 @@ class PgVectorTable(VectorTable):
         coalesce_parts = " || ' ' || ".join(
             f"COALESCE({f}, '')" for f in field_names
         )
-        index_name = f"idx_{self._table_name}_fts"
+        table_token = self._table_name.rsplit(".", 1)[-1]
+        index_name = f"idx_{table_token}_fts"
 
         with self._pool.connection() as conn:
             conn.execute(
@@ -241,7 +243,8 @@ class PgVectorTable(VectorTable):
 
     def create_scalar_index(self, column: str) -> None:
         _validate_identifier(column)
-        index_name = f"idx_{self._table_name}_{column}_btree"
+        table_token = self._table_name.rsplit(".", 1)[-1]
+        index_name = f"idx_{table_token}_{column}_btree"
         sql = (
             f"CREATE INDEX IF NOT EXISTS {index_name} "
             f"ON {self._table_name} ({column})"
@@ -257,11 +260,19 @@ class PgVectorTable(VectorTable):
         if self._embedding_fn is None:
             return df
 
-        if self._vector_column not in df.columns or bool(df[self._vector_column].isna().all()):
-            source_texts = df[self._source_column].tolist()
-            embeddings = self._embedding_fn.generate_embeddings(source_texts)
+        if self._vector_column not in df.columns:
             df = df.copy()
-            df[self._vector_column] = embeddings
+            df[self._vector_column] = self._embedding_fn.generate_embeddings(
+                df[self._source_column].tolist()
+            )
+            return df
+
+        missing = df[self._vector_column].isna()
+        if missing.any():
+            df = df.copy()
+            df.loc[missing, self._vector_column] = self._embedding_fn.generate_embeddings(
+                df.loc[missing, self._source_column].tolist()
+            )
 
         return df
 
@@ -484,6 +495,11 @@ class PgVectorDb(VectorDatabase):
                 conn.commit()
         elif not exist_ok:
             raise ValueError(f"Schema is required to create table '{table_name}'")
+        else:
+            if not self.table_exists(table_name):
+                raise ValueError(
+                    f"Table '{table_name}' does not exist and no schema was provided to create it."
+                )
 
         table = PgVectorTable(
             table_name=qualified,
@@ -520,6 +536,12 @@ class PgVectorDb(VectorDatabase):
                 (self._schema, table_name),
             ).fetchall()
             column_names = [r["column_name"] if isinstance(r, dict) else r[0] for r in rows]
+
+        if not column_names:
+            raise ValueError(
+                f"Table '{table_name}' not found in schema '{self._schema}'. "
+                "Use create_table() first."
+            )
 
         table = PgVectorTable(
             table_name=qualified,

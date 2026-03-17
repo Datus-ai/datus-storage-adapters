@@ -147,10 +147,10 @@ assert db.table_exists("my_table") == False
 
 ```toml
 [project.entry-points."datus.storage.rdb"]
-postgresql = "rdb:register"
+postgresql = "datus_storage_postgresql.rdb:register"
 
 [project.entry-points."datus.storage.vector"]
-postgresql = "vector:register"
+postgresql = "datus_storage_postgresql.vector:register"
 ```
 
 Once installed, datus-agent discovers and registers both backends automatically — no manual wiring needed.
@@ -158,7 +158,7 @@ Once installed, datus-agent discovers and registers both backends automatically 
 ## Source Layout
 
 ```
-src/
+datus_storage_postgresql/
 ├── rdb/
 │   ├── __init__.py          # register() → RdbRegistry
 │   └── backend.py           # PostgresRdbBackend

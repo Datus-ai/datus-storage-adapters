@@ -9,7 +9,7 @@ datus-storage-adapter/
 ├── pyproject.toml                  # uv workspace root
 └── datus-storage-postgresql/       # PostgreSQL adapter package
     ├── pyproject.toml
-    ├── src/
+    ├── datus_storage_postgresql/
     │   ├── rdb/                    # Relational database backend
     │   └── vector/                 # Vector database backend (pgvector)
     └── tests/

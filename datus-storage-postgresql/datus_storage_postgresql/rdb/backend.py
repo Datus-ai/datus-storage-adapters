@@ -153,7 +153,7 @@ class PgRdbTable(RdbTable):
 
     def insert(self, record: Any) -> int:
         data = {k: v for k, v in dataclasses.asdict(record).items() if v is not None}
-        columns = list(data.keys())
+        columns = [_validate_identifier(k) for k in data.keys()]
         placeholders = ", ".join(["%s"] * len(columns))
         col_names = ", ".join(columns)
         sql = f"INSERT INTO {self._qualified_name} ({col_names}) VALUES ({placeholders}) RETURNING {self._pk_column}"
@@ -224,10 +224,10 @@ class PgRdbTable(RdbTable):
 
     def upsert(self, record: Any, conflict_columns: List[str]) -> None:
         data = {k: v for k, v in dataclasses.asdict(record).items() if v is not None}
-        columns = list(data.keys())
+        columns = [_validate_identifier(k) for k in data.keys()]
         placeholders = ", ".join(["%s"] * len(columns))
         col_names = ", ".join(columns)
-        conflict_cols = ", ".join(conflict_columns)
+        conflict_cols = ", ".join(_validate_identifier(c) for c in conflict_columns)
         update_cols = [c for c in columns if c not in conflict_columns]
         update_set = ", ".join(f"{c} = EXCLUDED.{c}" for c in update_cols)
 

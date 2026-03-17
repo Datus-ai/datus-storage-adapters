@@ -12,7 +12,7 @@ from typing import Any, Dict
 class RdbBackendConfig:
     """Configuration for the relational database backend."""
 
-    type: str = ""
+    type: str = "sqlite"
     params: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -20,7 +20,7 @@ class RdbBackendConfig:
 class VectorBackendConfig:
     """Configuration for the vector database backend."""
 
-    type: str = ""
+    type: str = "lance"
     params: Dict[str, Any] = field(default_factory=dict)
 
 

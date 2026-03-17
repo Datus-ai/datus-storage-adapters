@@ -5,6 +5,7 @@ Registered as an entry point: datus.storage.vector.testing:postgresql
 """
 
 import logging
+import threading
 import uuid
 from typing import Any, Dict, Optional
 
@@ -20,41 +21,44 @@ class _SharedContainer:
     _ref_count: int = 0
     _host: Optional[str] = None
     _port: Optional[int] = None
+    _lock = threading.Lock()
 
     @classmethod
     def acquire(cls):
         """Start the container if not already running, increment ref count."""
-        if cls._ref_count == 0:
-            from testcontainers.postgres import PostgresContainer
+        with cls._lock:
+            if cls._ref_count == 0:
+                from testcontainers.postgres import PostgresContainer
 
-            cls._container = PostgresContainer(
-                image="pgvector/pgvector:pg17",
-                username="datus_test",
-                password="datus_test",
-                dbname="datus_test",
-            )
-            cls._container.start()
-            cls._host = cls._container.get_container_host_ip()
-            cls._port = int(cls._container.get_exposed_port(5432))
-            logger.info("Started shared PostgreSQL test container")
-        cls._ref_count += 1
-        return cls._host, cls._port
+                cls._container = PostgresContainer(
+                    image="pgvector/pgvector:pg17",
+                    username="datus_test",
+                    password="datus_test",
+                    dbname="datus_test",
+                )
+                cls._container.start()
+                cls._host = cls._container.get_container_host_ip()
+                cls._port = int(cls._container.get_exposed_port(5432))
+                logger.info("Started shared PostgreSQL test container")
+            cls._ref_count += 1
+            return cls._host, cls._port
 
     @classmethod
     def release(cls):
         """Decrement ref count; stop the container when no more users."""
-        cls._ref_count -= 1
-        if cls._ref_count <= 0:
-            cls._ref_count = 0
-            if cls._container is not None:
-                try:
-                    cls._container.stop()
-                    logger.info("Stopped shared PostgreSQL test container")
-                except Exception:
-                    pass
-                cls._container = None
-                cls._host = None
-                cls._port = None
+        with cls._lock:
+            cls._ref_count -= 1
+            if cls._ref_count <= 0:
+                cls._ref_count = 0
+                if cls._container is not None:
+                    try:
+                        cls._container.stop()
+                        logger.info("Stopped shared PostgreSQL test container")
+                    except Exception:
+                        pass
+                    cls._container = None
+                    cls._host = None
+                    cls._port = None
 
     @classmethod
     def admin_conninfo(cls) -> str:
@@ -76,12 +80,13 @@ class PgvectorTestEnv(VectorTestEnv):
 
     def setup(self) -> None:
         import psycopg
+        from psycopg import sql
 
         host, port = _SharedContainer.acquire()
         self._dbname = "test_" + uuid.uuid4().hex[:12]
 
         with psycopg.connect(_SharedContainer.admin_conninfo(), autocommit=True) as conn:
-            conn.execute(f"CREATE DATABASE {self._dbname}")
+            conn.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(self._dbname)))
 
         self._config = {
             "host": host,
@@ -95,10 +100,11 @@ class PgvectorTestEnv(VectorTestEnv):
     def teardown(self) -> None:
         if self._dbname is not None:
             import psycopg
+            from psycopg import sql
 
             try:
                 with psycopg.connect(_SharedContainer.admin_conninfo(), autocommit=True) as conn:
-                    conn.execute(f"DROP DATABASE IF EXISTS {self._dbname}")
+                    conn.execute(sql.SQL("DROP DATABASE IF EXISTS {}").format(sql.Identifier(self._dbname)))
                 logger.info("Dropped test database %s", self._dbname)
             except Exception:
                 pass

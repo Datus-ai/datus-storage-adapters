@@ -181,6 +181,9 @@ class PgRdbTable(RdbTable):
         columns: Optional[List[str]] = None,
         order_by: Optional[List[str]] = None,
     ) -> List[T]:
+        if columns:
+            for c in columns:
+                _validate_identifier(c)
         col_str = ", ".join(columns) if columns else "*"
         where_sql, params = self._build_where(where)
         order_sql = self._build_order_by(order_by)
@@ -193,6 +196,8 @@ class PgRdbTable(RdbTable):
     def update(self, data: Dict[str, Any], where: Optional[WhereClause] = None) -> int:
         if not data:
             return 0
+        for col in data.keys():
+            _validate_identifier(col)
         set_parts = [f"{col} = %s" for col in data.keys()]
         set_sql = ", ".join(set_parts)
         where_sql, where_params = self._build_where(where)

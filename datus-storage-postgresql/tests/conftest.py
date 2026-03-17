@@ -3,6 +3,8 @@
 import pytest
 from testcontainers.postgres import PostgresContainer
 
+from datus_storage_base.vector.base import EmbeddingFunction
+
 
 @pytest.fixture(scope="session")
 def pg_container():
@@ -30,8 +32,10 @@ def pg_config(pg_container):
     }
 
 
-class MockEmbeddingFunction:
+class MockEmbeddingFunction(EmbeddingFunction):
     """Mock embedding function for testing without a real model."""
+
+    name = "mock"
 
     def ndims(self):
         return 4

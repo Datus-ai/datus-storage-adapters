@@ -275,6 +275,10 @@ def ne(field: str, value: Any) -> Condition:
     return Condition(field, Op.NE, value)
 
 
+def gt(field: str, value: Any) -> Condition:
+    return Condition(field, Op.GT, value)
+
+
 def gte(field: str, value: Any) -> Condition:
     return Condition(field, Op.GTE, value)
 

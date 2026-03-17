@@ -107,6 +107,7 @@ class PgVectorTable(VectorTable):
         set_parts = []
         params = []
         for col, val in values.items():
+            _validate_identifier(col)
             set_parts.append(f"{col} = %s")
             params.append(val)
         set_clause = ", ".join(set_parts)
@@ -117,6 +118,13 @@ class PgVectorTable(VectorTable):
             conn.commit()
 
     # -- Search operations --
+
+    @staticmethod
+    def _validate_select_fields(fields: List[str]) -> str:
+        """Validate and join select field names."""
+        for f in fields:
+            _validate_identifier(f)
+        return ", ".join(fields)
 
     def search_vector(
         self,
@@ -129,7 +137,8 @@ class PgVectorTable(VectorTable):
         compiled = build_where(where)
         query_embedding = self._compute_query_embedding(query_text)
 
-        columns = ", ".join(select_fields) if select_fields else self._select_columns()
+        columns = self._validate_select_fields(select_fields) if select_fields else self._select_columns()
+        _validate_identifier(vector_column)
         where_clause = f"WHERE {compiled}" if compiled else ""
         sql = (
             f"SELECT {columns} FROM {self._table_name} "
@@ -166,13 +175,10 @@ class PgVectorTable(VectorTable):
         limit: Optional[int] = None,
     ) -> pa.Table:
         compiled = build_where(where)
-        columns = ", ".join(select_fields) if select_fields else self._select_columns()
+        columns = self._validate_select_fields(select_fields) if select_fields else self._select_columns()
         where_clause = f"WHERE {compiled}" if compiled else ""
 
-        if limit is None:
-            limit = self.count_rows(where)
-
-        limit_clause = f"LIMIT {int(limit)}" if limit else ""
+        limit_clause = f"LIMIT {int(limit)}" if limit is not None else ""
         sql = f"SELECT {columns} FROM {self._table_name} {where_clause} {limit_clause}"
 
         with self._pool.connection() as conn:
@@ -193,6 +199,7 @@ class PgVectorTable(VectorTable):
     # -- Index operations --
 
     def create_vector_index(self, column: str, metric: str = "cosine", **kwargs) -> None:
+        _validate_identifier(column)
         index_name = f"idx_{self._table_name}_{column}_hnsw"
         ops_map = {
             "cosine": "vector_cosine_ops",
@@ -211,6 +218,8 @@ class PgVectorTable(VectorTable):
     def create_fts_index(self, field_names: Union[str, List[str]]) -> None:
         if isinstance(field_names, str):
             field_names = [field_names]
+        for f in field_names:
+            _validate_identifier(f)
 
         tsv_col = "tsv"
         coalesce_parts = " || ' ' || ".join(
@@ -231,6 +240,7 @@ class PgVectorTable(VectorTable):
             conn.commit()
 
     def create_scalar_index(self, column: str) -> None:
+        _validate_identifier(column)
         index_name = f"idx_{self._table_name}_{column}_btree"
         sql = (
             f"CREATE INDEX IF NOT EXISTS {index_name} "
@@ -271,6 +281,8 @@ class PgVectorTable(VectorTable):
             return
 
         columns = list(df.columns)
+        for c in columns:
+            _validate_identifier(c)
         col_names = ", ".join(columns)
         placeholders = ", ".join(["%s"] * len(columns))
         sql = f"INSERT INTO {self._table_name} ({col_names}) VALUES ({placeholders})"
@@ -296,6 +308,9 @@ class PgVectorTable(VectorTable):
             return
 
         columns = list(df.columns)
+        for c in columns:
+            _validate_identifier(c)
+        _validate_identifier(on_column)
         col_names = ", ".join(columns)
         placeholders = ", ".join(["%s"] * len(columns))
         update_cols = [c for c in columns if c != on_column]

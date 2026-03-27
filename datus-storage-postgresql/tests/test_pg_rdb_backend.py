@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 import pytest
+from psycopg_pool import PoolClosed
 
 from datus_storage_base.rdb.base import (
     ColumnDef,
@@ -12,8 +13,6 @@ from datus_storage_base.rdb.base import (
     TableDefinition,
     WhereOp,
 )
-from psycopg_pool import PoolClosed
-
 from datus_storage_postgresql.rdb.backend import PgRdbDatabase, PgRdbTable, PostgresRdbBackend
 
 
@@ -62,11 +61,9 @@ def db(backend):
     # Clean up all tables to prevent cross-test data leaks
     try:
         with d.get_connection() as conn:
-            rows = conn.execute(
-                "SELECT tablename FROM pg_tables WHERE schemaname = 'public'"
-            ).fetchall()
+            rows = conn.execute("SELECT tablename FROM pg_tables WHERE schemaname = 'public'").fetchall()
             for row in rows:
-                tbl = row['tablename'] if isinstance(row, dict) else row[0]
+                tbl = row["tablename"] if isinstance(row, dict) else row[0]
                 conn.execute(f'DROP TABLE IF EXISTS "{tbl}" CASCADE')
             conn.commit()
     except Exception:
@@ -96,7 +93,6 @@ def test_table_def():
 
 
 class TestBackendLifecycle:
-
     def test_initialize_missing_all_keys(self):
         b = PostgresRdbBackend()
         with pytest.raises(ValueError, match="Missing required"):
@@ -144,7 +140,6 @@ class TestBackendLifecycle:
 
 
 class TestEnsureTable:
-
     def test_returns_pg_rdb_table(self, db, test_table_def):
         table = db.ensure_table(test_table_def)
         assert isinstance(table, PgRdbTable)
@@ -223,7 +218,6 @@ class TestEnsureTable:
 
 
 class TestInsert:
-
     def test_basic(self, db, test_table_def):
         table = db.ensure_table(test_table_def)
         row_id = table.insert(TestItem(name="item1", value="val1", score=10))
@@ -245,7 +239,7 @@ class TestInsert:
     def test_none_fields_excluded(self, db, test_table_def):
         """Fields with None are excluded from INSERT, using DB defaults."""
         table = db.ensure_table(test_table_def)
-        row_id = table.insert(TestItem(name="no_score"))
+        table.insert(TestItem(name="no_score"))
         results = table.query(TestItem, where={"name": "no_score"})
         assert len(results) == 1
         # score should use DB default (0)
@@ -258,7 +252,6 @@ class TestInsert:
 
 
 class TestQuery:
-
     def test_all_rows(self, db, test_table_def):
         table = db.ensure_table(test_table_def)
         table.insert(TestItem(name="q1", value="v1", score=10))
@@ -321,9 +314,7 @@ class TestQuery:
         table = db.ensure_table(test_table_def)
         table.insert(TestItem(name="null1", value=None, score=10))
         table.insert(TestItem(name="null2", value="v2", score=20))
-        results = table.query(
-            TestItem, where=[("value", WhereOp.IS_NULL, None)]
-        )
+        results = table.query(TestItem, where=[("value", WhereOp.IS_NULL, None)])
         assert len(results) == 1
         assert results[0].name == "null1"
 
@@ -331,9 +322,7 @@ class TestQuery:
         table = db.ensure_table(test_table_def)
         table.insert(TestItem(name="nn1", value=None, score=10))
         table.insert(TestItem(name="nn2", value="v2", score=20))
-        results = table.query(
-            TestItem, where=[("value", WhereOp.IS_NOT_NULL, None)]
-        )
+        results = table.query(TestItem, where=[("value", WhereOp.IS_NOT_NULL, None)])
         assert len(results) == 1
         assert results[0].name == "nn2"
 
@@ -368,7 +357,6 @@ class TestQuery:
 
 
 class TestUpdate:
-
     def test_single_row(self, db, test_table_def):
         table = db.ensure_table(test_table_def)
         table.insert(TestItem(name="up1", value="old", score=10))
@@ -411,7 +399,6 @@ class TestUpdate:
 
 
 class TestDelete:
-
     def test_with_where(self, db, test_table_def):
         table = db.ensure_table(test_table_def)
         table.insert(TestItem(name="d1", value="v1"))
@@ -442,7 +429,6 @@ class TestDelete:
 
 
 class TestUpsert:
-
     def test_insert_new(self, db):
         table_def = TableDefinition(
             table_name="upsert_new",
@@ -498,7 +484,6 @@ class TestUpsert:
 
 
 class TestTransaction:
-
     def test_commit(self, db, test_table_def):
         table = db.ensure_table(test_table_def)
         with db.transaction():
@@ -535,7 +520,6 @@ class TestTransaction:
 
 
 class TestNamespace:
-
     def test_creates_schema(self, backend):
         db = backend.connect(namespace="test_ns_rdb", store_db_name="test")
         table_def = TableDefinition(
@@ -607,7 +591,6 @@ class TestNamespace:
 
 
 class TestConvenienceMethods:
-
     def test_execute_and_query(self, db, test_table_def):
         db.ensure_table(test_table_def)
         with db.get_connection() as conn:
@@ -716,7 +699,6 @@ def logical_table(logical_db, logical_test_table_def):
 
 
 class TestLogicalIsolation:
-
     def test_table_in_public_schema(self, logical_db, logical_test_table_def):
         """Logical isolation uses public schema, not namespace as schema."""
         table = logical_db.ensure_table(logical_test_table_def)
@@ -728,8 +710,7 @@ class TestLogicalIsolation:
         with logical_db.get_connection() as conn:
             rows = logical_db.execute_query(
                 conn,
-                "SELECT column_name FROM information_schema.columns "
-                "WHERE table_name = %s AND column_name = %s",
+                "SELECT column_name FROM information_schema.columns WHERE table_name = %s AND column_name = %s",
                 ("logical_test_items", "datasource_id"),
             )
             assert len(rows) == 1
@@ -740,8 +721,7 @@ class TestLogicalIsolation:
         with logical_db.get_connection() as conn:
             rows = logical_db.execute_query(
                 conn,
-                "SELECT indexname FROM pg_indexes "
-                "WHERE tablename = %s AND indexname LIKE %s",
+                "SELECT indexname FROM pg_indexes WHERE tablename = %s AND indexname LIKE %s",
                 ("logical_test_items", "%datasource_id%"),
             )
             assert len(rows) >= 1

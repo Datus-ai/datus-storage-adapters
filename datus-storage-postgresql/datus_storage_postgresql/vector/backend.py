@@ -11,7 +11,7 @@ Three-layer architecture:
 import logging
 import re
 import threading
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Union
 
 import pandas as pd
 import pyarrow as pa
@@ -163,10 +163,7 @@ class PgVectorTable(VectorTable):
         _validate_identifier(vector_column)
         where_clause = f"WHERE {combined}" if combined else ""
         sql = (
-            f"SELECT {columns} FROM {self._table_name} "
-            f"{where_clause} "
-            f"ORDER BY {vector_column} <=> %s::vector "
-            f"LIMIT %s"
+            f"SELECT {columns} FROM {self._table_name} {where_clause} ORDER BY {vector_column} <=> %s::vector LIMIT %s"
         )
         with self._pool.connection() as conn:
             rows = conn.execute(sql, (str(query_embedding), top_n)).fetchall()
@@ -238,10 +235,7 @@ class PgVectorTable(VectorTable):
             "ip": "vector_ip_ops",
         }
         ops = ops_map.get(metric, "vector_cosine_ops")
-        sql = (
-            f"CREATE INDEX IF NOT EXISTS {index_name} "
-            f"ON {self._table_name} USING hnsw ({column} {ops})"
-        )
+        sql = f"CREATE INDEX IF NOT EXISTS {index_name} ON {self._table_name} USING hnsw ({column} {ops})"
         with self._pool.connection() as conn:
             conn.execute(sql)
             conn.commit()
@@ -253,9 +247,7 @@ class PgVectorTable(VectorTable):
             _validate_identifier(f)
 
         tsv_col = "tsv"
-        coalesce_parts = " || ' ' || ".join(
-            f"COALESCE({f}, '')" for f in field_names
-        )
+        coalesce_parts = " || ' ' || ".join(f"COALESCE({f}, '')" for f in field_names)
         table_token = self._table_name.rsplit(".", 1)[-1]
         index_name = f"idx_{table_token}_fts"
 
@@ -265,20 +257,14 @@ class PgVectorTable(VectorTable):
                 f"ADD COLUMN IF NOT EXISTS {tsv_col} tsvector "
                 f"GENERATED ALWAYS AS (to_tsvector('english', {coalesce_parts})) STORED"
             )
-            conn.execute(
-                f"CREATE INDEX IF NOT EXISTS {index_name} "
-                f"ON {self._table_name} USING gin ({tsv_col})"
-            )
+            conn.execute(f"CREATE INDEX IF NOT EXISTS {index_name} ON {self._table_name} USING gin ({tsv_col})")
             conn.commit()
 
     def create_scalar_index(self, column: str) -> None:
         _validate_identifier(column)
         table_token = self._table_name.rsplit(".", 1)[-1]
         index_name = f"idx_{table_token}_{column}_btree"
-        sql = (
-            f"CREATE INDEX IF NOT EXISTS {index_name} "
-            f"ON {self._table_name} ({column})"
-        )
+        sql = f"CREATE INDEX IF NOT EXISTS {index_name} ON {self._table_name} ({column})"
         with self._pool.connection() as conn:
             conn.execute(sql)
             conn.commit()
@@ -310,9 +296,7 @@ class PgVectorTable(VectorTable):
 
         if self._vector_column not in df.columns:
             df = df.copy()
-            df[self._vector_column] = self._embedding_fn.generate_embeddings(
-                df[self._source_column].tolist()
-            )
+            df[self._vector_column] = self._embedding_fn.generate_embeddings(df[self._source_column].tolist())
             return df
 
         missing = df[self._vector_column].isna()
@@ -419,12 +403,22 @@ class PgVectorTable(VectorTable):
         if not rows:
             if select_fields:
                 arrays = {
-                    f: pa.array([], type=pa.list_(pa.float32(), list_size=self._vector_dim) if f == self._vector_column else pa.string())
+                    f: pa.array(
+                        [],
+                        type=pa.list_(pa.float32(), list_size=self._vector_dim)
+                        if f == self._vector_column
+                        else pa.string(),
+                    )
                     for f in select_fields
                 }
             elif self._column_names:
                 arrays = {
-                    c: pa.array([], type=pa.list_(pa.float32(), list_size=self._vector_dim) if c == self._vector_column else pa.string())
+                    c: pa.array(
+                        [],
+                        type=pa.list_(pa.float32(), list_size=self._vector_dim)
+                        if c == self._vector_column
+                        else pa.string(),
+                    )
                     for c in self._column_names
                 }
             else:
@@ -448,9 +442,7 @@ class PgVectorTable(VectorTable):
                         parsed.append(v)
                     else:
                         parsed.append(list(v) if v is not None else [0.0] * self._vector_dim)
-                arrays[col] = pa.array(
-                    parsed, type=pa.list_(pa.float32(), list_size=self._vector_dim)
-                )
+                arrays[col] = pa.array(parsed, type=pa.list_(pa.float32(), list_size=self._vector_dim))
             else:
                 arrays[col] = pa.array(values)
 
@@ -491,11 +483,7 @@ class PgVectorDb(VectorDatabase):
         # Ensure schema exists for non-public namespaces
         if self._schema != "public":
             with self._pool.connection() as conn:
-                conn.execute(
-                    psql.SQL("CREATE SCHEMA IF NOT EXISTS {}").format(
-                        psql.Identifier(self._schema)
-                    )
-                )
+                conn.execute(psql.SQL("CREATE SCHEMA IF NOT EXISTS {}").format(psql.Identifier(self._schema)))
                 conn.commit()
 
     @property
@@ -516,8 +504,7 @@ class PgVectorDb(VectorDatabase):
     def table_exists(self, table_name: str) -> bool:
         with self._pool.connection() as conn:
             rows = conn.execute(
-                "SELECT EXISTS (SELECT 1 FROM information_schema.tables "
-                "WHERE table_schema = %s AND table_name = %s)",
+                "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = %s AND table_name = %s)",
                 (self._schema, table_name),
             ).fetchone()
             if isinstance(rows, dict):
@@ -527,9 +514,7 @@ class PgVectorDb(VectorDatabase):
     def table_names(self, limit: int = 100) -> List[str]:
         with self._pool.connection() as conn:
             rows = conn.execute(
-                "SELECT table_name FROM information_schema.tables "
-                "WHERE table_schema = %s "
-                "ORDER BY table_name LIMIT %s",
+                "SELECT table_name FROM information_schema.tables WHERE table_schema = %s ORDER BY table_name LIMIT %s",
                 (self._schema, limit),
             ).fetchall()
             return [r["table_name"] if isinstance(r, dict) else r[0] for r in rows]
@@ -570,18 +555,13 @@ class PgVectorDb(VectorDatabase):
                 if self._isolation == IsolationType.LOGICAL:
                     table_token = table_name
                     idx_name = f"idx_{table_token}_{DATASOURCE_ID_COLUMN}"
-                    conn.execute(
-                        f"CREATE INDEX IF NOT EXISTS {idx_name} "
-                        f"ON {qualified} ({DATASOURCE_ID_COLUMN})"
-                    )
+                    conn.execute(f"CREATE INDEX IF NOT EXISTS {idx_name} ON {qualified} ({DATASOURCE_ID_COLUMN})")
                 conn.commit()
         elif not exist_ok:
             raise ValueError(f"Schema is required to create table '{table_name}'")
         else:
             if not self.table_exists(table_name):
-                raise ValueError(
-                    f"Table '{table_name}' does not exist and no schema was provided to create it."
-                )
+                raise ValueError(f"Table '{table_name}' does not exist and no schema was provided to create it.")
 
         table = PgVectorTable(
             table_name=qualified,
@@ -627,10 +607,7 @@ class PgVectorDb(VectorDatabase):
             column_names = [r["column_name"] if isinstance(r, dict) else r[0] for r in rows]
 
         if not column_names:
-            raise ValueError(
-                f"Table '{table_name}' not found in schema '{self._schema}'. "
-                "Use create_table() first."
-            )
+            raise ValueError(f"Table '{table_name}' not found in schema '{self._schema}'. Use create_table() first.")
 
         table = PgVectorTable(
             table_name=qualified,
@@ -729,9 +706,7 @@ class PgvectorBackend(BaseVectorBackend):
 
             # Ensure pgvector extension is available
             with pool.connection() as conn:
-                row = conn.execute(
-                    "SELECT 1 FROM pg_extension WHERE extname = 'vector'"
-                ).fetchone()
+                row = conn.execute("SELECT 1 FROM pg_extension WHERE extname = 'vector'").fetchone()
                 if not row:
                     try:
                         conn.execute("CREATE EXTENSION IF NOT EXISTS vector")

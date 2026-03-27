@@ -30,3 +30,5 @@ venv/
 # OS
 .DS_Store
 Thumbs.db
+uv.lock
+uv.toml

@@ -3,11 +3,11 @@
 import pandas as pd
 import pyarrow as pa
 import pytest
+from conftest import MockEmbeddingFunction
 from psycopg_pool import PoolClosed
 
-from datus_storage_base.conditions import eq, and_, or_, not_
-from datus_storage_postgresql.vector.backend import PgVectorDb, PgVectorTable, PgvectorBackend
-from conftest import MockEmbeddingFunction
+from datus_storage_base.conditions import and_, eq, not_, or_
+from datus_storage_postgresql.vector.backend import PgvectorBackend, PgVectorDb, PgVectorTable
 
 
 @pytest.fixture
@@ -56,9 +56,7 @@ def table(db, test_schema, embedding_function):
         source_column="description",
     )
     with db.pool.connection() as conn:
-        conn.execute(
-            f"ALTER TABLE {tbl.table_name} ADD CONSTRAINT uq_test_vectors_id UNIQUE (id)"
-        )
+        conn.execute(f"ALTER TABLE {tbl.table_name} ADD CONSTRAINT uq_test_vectors_id UNIQUE (id)")
         conn.commit()
     return tbl
 
@@ -81,7 +79,6 @@ def _sample_df(ids, descriptions=None, categories=None):
 
 
 class TestBackendLifecycle:
-
     def test_initialize_stores_config(self, pg_config):
         b = PgvectorBackend()
         b.initialize(pg_config)
@@ -112,14 +109,12 @@ class TestBackendLifecycle:
                 pass
 
 
-
 # ==============================================================================
 # Database-level tests (PgVectorDb)
 # ==============================================================================
 
 
 class TestPgVectorDb:
-
     def test_table_exists(self, db, table):
         assert db.table_exists("test_vectors")
         assert not db.table_exists("nonexistent_table")
@@ -176,7 +171,9 @@ class TestPgVectorDb:
         db.drop_table("no_such_table_xyz", ignore_missing=True)
 
     def test_drop_table_missing_raises(self, db):
-        with pytest.raises(Exception):  # psycopg.errors.UndefinedTable
+        from psycopg.errors import UndefinedTable
+
+        with pytest.raises(UndefinedTable):
             db.drop_table("no_such_table_xyz", ignore_missing=False)
 
     def test_refresh_table(self, db, table):
@@ -191,7 +188,6 @@ class TestPgVectorDb:
 
 
 class TestVectorTableWrite:
-
     def test_add(self, table):
         table.add(_sample_df(["1", "2", "3"]))
         assert table.count_rows() == 3
@@ -256,7 +252,6 @@ class TestVectorTableWrite:
 
 
 class TestVectorTableSearch:
-
     def test_search_vector(self, table):
         table.add(_sample_df(["s1", "s2", "s3"]))
         results = table.search_vector(query_text="test", vector_column="vector", top_n=2)
@@ -265,7 +260,9 @@ class TestVectorTableSearch:
     def test_search_vector_with_where_str(self, table):
         table.add(_sample_df(["w1", "w2", "w3"], categories=["alpha", "beta", "alpha"]))
         results = table.search_vector(
-            query_text="test", vector_column="vector", top_n=10,
+            query_text="test",
+            vector_column="vector",
+            top_n=10,
             where="category = 'alpha'",
         )
         assert results.num_rows == 2
@@ -273,7 +270,9 @@ class TestVectorTableSearch:
     def test_search_vector_with_where_expr(self, table):
         table.add(_sample_df(["we1", "we2", "we3"], categories=["alpha", "beta", "alpha"]))
         results = table.search_vector(
-            query_text="test", vector_column="vector", top_n=10,
+            query_text="test",
+            vector_column="vector",
+            top_n=10,
             where=eq("category", "alpha"),
         )
         assert results.num_rows == 2
@@ -281,7 +280,9 @@ class TestVectorTableSearch:
     def test_search_vector_with_select_fields(self, table):
         table.add(_sample_df(["sel1"]))
         results = table.search_vector(
-            query_text="test", vector_column="vector", top_n=1,
+            query_text="test",
+            vector_column="vector",
+            top_n=1,
             select_fields=["id", "category"],
         )
         assert results.num_rows == 1
@@ -298,7 +299,9 @@ class TestVectorTableSearch:
     def test_search_hybrid_fallback(self, table):
         table.add(_sample_df(["h1"]))
         results = table.search_hybrid(
-            query_text="test", vector_source_column="description", top_n=1,
+            query_text="test",
+            vector_source_column="description",
+            top_n=1,
         )
         assert results.num_rows == 1
 
@@ -361,7 +364,6 @@ class TestVectorTableSearch:
 
 
 class TestCountRows:
-
     def test_count_no_filter(self, table):
         table.add(_sample_df(["c1", "c2", "c3"]))
         assert table.count_rows() == 3
@@ -384,7 +386,6 @@ class TestCountRows:
 
 
 class TestIndexOperations:
-
     def test_vector_index_cosine(self, table):
         table.add(_sample_df([f"vi{i}" for i in range(10)]))
         table.create_vector_index("vector", metric="cosine")
@@ -413,7 +414,6 @@ class TestIndexOperations:
 
 
 class TestVectorNamespace:
-
     def test_namespace_creates_schema(self, backend):
         db = backend.connect("vec_ns_test")
         assert db.namespace == "vec_ns_test"
@@ -452,7 +452,6 @@ class TestVectorNamespace:
 
 
 class TestArrowConversion:
-
     def test_rows_to_arrow_types(self, table):
         """Verify returned PyArrow table has correct types."""
         table.add(_sample_df(["ar1", "ar2"]))
@@ -504,7 +503,6 @@ def logical_table(logical_db, test_schema, embedding_function):
 
 
 class TestVectorLogicalIsolation:
-
     def test_table_in_public_schema(self, logical_table):
         """Logical isolation uses public schema."""
         assert "." not in logical_table.table_name  # no schema prefix
@@ -513,8 +511,7 @@ class TestVectorLogicalIsolation:
         """create_table auto-adds datasource_id column."""
         with logical_db.pool.connection() as conn:
             rows = conn.execute(
-                "SELECT column_name FROM information_schema.columns "
-                "WHERE table_name = %s AND column_name = %s",
+                "SELECT column_name FROM information_schema.columns WHERE table_name = %s AND column_name = %s",
                 ("logical_vectors", "datasource_id"),
             ).fetchall()
             assert len(rows) == 1
@@ -523,9 +520,7 @@ class TestVectorLogicalIsolation:
         """add() auto-injects datasource_id."""
         logical_table.add(_sample_df(["la1"]))
         with logical_db.pool.connection() as conn:
-            rows = conn.execute(
-                "SELECT datasource_id FROM logical_vectors WHERE id = 'la1'"
-            ).fetchall()
+            rows = conn.execute("SELECT datasource_id FROM logical_vectors WHERE id = 'la1'").fetchall()
             val = rows[0]["datasource_id"] if isinstance(rows[0], dict) else rows[0][0]
             assert val == "tenant_a"
 

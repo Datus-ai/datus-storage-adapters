@@ -7,6 +7,7 @@ Registered as an entry point: datus.storage.rdb.testing:postgresql
 import logging
 from typing import Any, Dict, Optional
 
+from datus_storage_base.backend_config import IsolationType
 from datus_storage_base.testing import RdbTestEnv, TestEnvConfig
 
 logger = logging.getLogger(__name__)
@@ -18,6 +19,12 @@ class PostgresRdbTestEnv(RdbTestEnv):
     def __init__(self):
         self._container = None
         self._config: Optional[Dict[str, Any]] = None
+        self._isolation = IsolationType.PHYSICAL
+        self._default_schema = "public"
+
+    def set_isolation(self, isolation: IsolationType, default_schema: str = "public") -> None:
+        self._isolation = isolation
+        self._default_schema = default_schema
 
     def setup(self) -> None:
         from testcontainers.postgres import PostgresContainer
@@ -62,24 +69,38 @@ class PostgresRdbTestEnv(RdbTestEnv):
             f"dbname={self._config['dbname']}"
         )
         with psycopg.connect(conninfo, autocommit=True) as conn:
-            if namespace:
-                conn.execute(
-                    sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(
-                        sql.Identifier(namespace)
-                    )
-                )
-            else:
-                # Drop all tables in public schema
+            if self._isolation == IsolationType.LOGICAL:
+                # Delete rows by datasource_id in all tables within the schema
+                schema = self._default_schema
                 rows = conn.execute(
-                    "SELECT tablename FROM pg_tables WHERE schemaname = 'public'"
+                    "SELECT tablename FROM pg_tables WHERE schemaname = %s",
+                    (schema,),
                 ).fetchall()
                 for row in rows:
                     tbl = row[0] if not isinstance(row, dict) else row["tablename"]
+                    qualified = f"{schema}.{tbl}" if schema != "public" else tbl
                     conn.execute(
-                        sql.SQL("DROP TABLE IF EXISTS {} CASCADE").format(
-                            sql.Identifier(tbl)
+                        f"DELETE FROM {qualified} WHERE datasource_id = %s",
+                        (namespace,),
+                    )
+            else:
+                if namespace:
+                    conn.execute(
+                        sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(
+                            sql.Identifier(namespace)
                         )
                     )
+                else:
+                    rows = conn.execute(
+                        "SELECT tablename FROM pg_tables WHERE schemaname = 'public'"
+                    ).fetchall()
+                    for row in rows:
+                        tbl = row[0] if not isinstance(row, dict) else row["tablename"]
+                        conn.execute(
+                            sql.SQL("DROP TABLE IF EXISTS {} CASCADE").format(
+                                sql.Identifier(tbl)
+                            )
+                        )
 
     def get_config(self) -> TestEnvConfig:
         return TestEnvConfig(backend_type="postgresql", params=dict(self._config or {}))

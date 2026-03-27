@@ -32,3 +32,5 @@ venv/
 Thumbs.db
 uv.lock
 uv.toml
+/.omc
+CLAUDE.md

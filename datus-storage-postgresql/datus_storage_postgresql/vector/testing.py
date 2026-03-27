@@ -64,10 +64,7 @@ class _SharedContainer:
 
     @classmethod
     def admin_conninfo(cls) -> str:
-        return (
-            f"host={cls._host} port={cls._port} "
-            f"user=datus_test password=datus_test dbname=datus_test"
-        )
+        return f"host={cls._host} port={cls._port} user=datus_test password=datus_test dbname=datus_test"
 
 
 class PgvectorTestEnv(VectorTestEnv):
@@ -154,22 +151,12 @@ class PgvectorTestEnv(VectorTestEnv):
                     )
             else:
                 if namespace:
-                    conn.execute(
-                        sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(
-                            sql.Identifier(namespace)
-                        )
-                    )
+                    conn.execute(sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(sql.Identifier(namespace)))
                 else:
-                    rows = conn.execute(
-                        "SELECT tablename FROM pg_tables WHERE schemaname = 'public'"
-                    ).fetchall()
+                    rows = conn.execute("SELECT tablename FROM pg_tables WHERE schemaname = 'public'").fetchall()
                     for row in rows:
                         tbl = row[0] if not isinstance(row, dict) else row["tablename"]
-                        conn.execute(
-                            sql.SQL("DROP TABLE IF EXISTS {} CASCADE").format(
-                                sql.Identifier(tbl)
-                            )
-                        )
+                        conn.execute(sql.SQL("DROP TABLE IF EXISTS {} CASCADE").format(sql.Identifier(tbl)))
 
     def get_config(self) -> TestEnvConfig:
         return TestEnvConfig(backend_type="postgresql", params=dict(self._config or {}))

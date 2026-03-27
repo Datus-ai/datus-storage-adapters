@@ -466,3 +466,120 @@ class TestArrowConversion:
         assert result.num_rows == 0
         assert "id" in result.column_names
         assert "category" in result.column_names
+
+
+# ==============================================================================
+# Vector logical isolation tests
+# ==============================================================================
+
+
+@pytest.fixture
+def logical_backend(pg_config):
+    """Create a PgvectorBackend with logical isolation."""
+    config = {**pg_config, "isolation": "logical"}
+    b = PgvectorBackend()
+    b.initialize(config)
+    yield b
+    b.close()
+
+
+@pytest.fixture
+def logical_db(logical_backend):
+    """Connect with a namespace under logical isolation."""
+    return logical_backend.connect("tenant_a")
+
+
+@pytest.fixture
+def logical_table(logical_db, test_schema, embedding_function):
+    """Create a test table under logical isolation."""
+    logical_db.drop_table("logical_vectors", ignore_missing=True)
+    tbl = logical_db.create_table(
+        "logical_vectors",
+        schema=test_schema,
+        embedding_function=embedding_function,
+        vector_column="vector",
+        source_column="description",
+    )
+    return tbl
+
+
+class TestVectorLogicalIsolation:
+
+    def test_table_in_public_schema(self, logical_table):
+        """Logical isolation uses public schema."""
+        assert "." not in logical_table.table_name  # no schema prefix
+
+    def test_datasource_id_column_created(self, logical_db, logical_table):
+        """create_table auto-adds datasource_id column."""
+        with logical_db.pool.connection() as conn:
+            rows = conn.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name = %s AND column_name = %s",
+                ("logical_vectors", "datasource_id"),
+            ).fetchall()
+            assert len(rows) == 1
+
+    def test_add_injects_datasource_id(self, logical_db, logical_table):
+        """add() auto-injects datasource_id."""
+        logical_table.add(_sample_df(["la1"]))
+        with logical_db.pool.connection() as conn:
+            rows = conn.execute(
+                "SELECT datasource_id FROM logical_vectors WHERE id = 'la1'"
+            ).fetchall()
+            val = rows[0]["datasource_id"] if isinstance(rows[0], dict) else rows[0][0]
+            assert val == "tenant_a"
+
+    def test_search_all_filters_by_datasource(self, logical_backend, test_schema, embedding_function):
+        """search_all only returns rows for the connected namespace."""
+        db_a = logical_backend.connect("tenant_a")
+        db_b = logical_backend.connect("tenant_b")
+
+        db_a.drop_table("shared_vec", ignore_missing=True)
+        tbl_a = db_a.create_table("shared_vec", schema=test_schema, embedding_function=embedding_function)
+        tbl_b = db_b.open_table("shared_vec", embedding_function=embedding_function)
+
+        tbl_a.add(_sample_df(["a1"]))
+        tbl_b.add(_sample_df(["b1", "b2"]))
+
+        assert tbl_a.count_rows() == 1
+        assert tbl_b.count_rows() == 2
+
+    def test_delete_scoped_to_datasource(self, logical_backend, test_schema, embedding_function):
+        """delete() only affects rows for the connected namespace."""
+        db_a = logical_backend.connect("tenant_a")
+        db_b = logical_backend.connect("tenant_b")
+
+        db_a.drop_table("del_vec", ignore_missing=True)
+        tbl_a = db_a.create_table("del_vec", schema=test_schema, embedding_function=embedding_function)
+        tbl_b = db_b.open_table("del_vec", embedding_function=embedding_function)
+
+        tbl_a.add(_sample_df(["da1"]))
+        tbl_b.add(_sample_df(["db1"]))
+
+        tbl_a.delete(eq("id", "da1"))
+        assert tbl_a.count_rows() == 0
+        assert tbl_b.count_rows() == 1
+
+    def test_update_scoped_to_datasource(self, logical_backend, test_schema, embedding_function):
+        """update() only affects rows for the connected namespace."""
+        db_a = logical_backend.connect("tenant_a")
+        db_b = logical_backend.connect("tenant_b")
+
+        db_a.drop_table("upd_vec", ignore_missing=True)
+        tbl_a = db_a.create_table("upd_vec", schema=test_schema, embedding_function=embedding_function)
+        tbl_b = db_b.open_table("upd_vec", embedding_function=embedding_function)
+
+        tbl_a.add(_sample_df(["ua1"], categories=["old"]))
+        tbl_b.add(_sample_df(["ub1"], categories=["old"]))
+
+        tbl_a.update(eq("id", "ua1"), {"category": "new"})
+        result_a = tbl_a.search_all()
+        result_b = tbl_b.search_all()
+        assert result_a.column("category")[0].as_py() == "new"
+        assert result_b.column("category")[0].as_py() == "old"
+
+    def test_search_all_excludes_datasource_id_from_results(self, logical_table):
+        """Default SELECT should not include datasource_id column."""
+        logical_table.add(_sample_df(["ex1"]))
+        result = logical_table.search_all()
+        assert "datasource_id" not in result.column_names

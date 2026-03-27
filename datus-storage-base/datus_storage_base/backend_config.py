@@ -36,7 +36,6 @@ class StorageBackendConfig:
     """Unified configuration for all storage backends."""
 
     isolation: IsolationType = IsolationType.PHYSICAL
-    default_schema: str = "public"
     rdb: RdbBackendConfig = field(default_factory=RdbBackendConfig)
     vector: VectorBackendConfig = field(default_factory=VectorBackendConfig)
 
@@ -66,11 +65,9 @@ class StorageBackendConfig:
 
         isolation_str = storage_config.get("isolation", IsolationType.PHYSICAL.value)
         isolation = IsolationType(isolation_str) if isinstance(isolation_str, str) else isolation_str
-        default_schema = storage_config.get("default_schema", "public")
 
         return StorageBackendConfig(
             isolation=isolation,
-            default_schema=default_schema,
             rdb=RdbBackendConfig(type=rdb_type, params=rdb_section),
             vector=VectorBackendConfig(type=vector_type, params=vector_section),
         )

@@ -80,11 +80,9 @@ class PgvectorTestEnv(VectorTestEnv):
         self._dbname: Optional[str] = None
         self._config: Optional[Dict[str, Any]] = None
         self._isolation = IsolationType.PHYSICAL
-        self._default_schema = "public"
 
-    def set_isolation(self, isolation: IsolationType, default_schema: str = "public") -> None:
+    def set_isolation(self, isolation: IsolationType) -> None:
         self._isolation = isolation
-        self._default_schema = default_schema
 
     def setup(self) -> None:
         import psycopg
@@ -142,7 +140,7 @@ class PgvectorTestEnv(VectorTestEnv):
         )
         with psycopg.connect(conninfo, autocommit=True) as conn:
             if self._isolation == IsolationType.LOGICAL:
-                schema = self._default_schema
+                schema = "public"
                 rows = conn.execute(
                     "SELECT tablename FROM pg_tables WHERE schemaname = %s",
                     (schema,),

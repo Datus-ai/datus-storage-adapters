@@ -474,7 +474,6 @@ class PgVectorDb(VectorDatabase):
         config: Dict[str, Any],
         namespace: str = "",
         isolation: IsolationType = IsolationType.PHYSICAL,
-        default_schema: str = "public",
     ):
         self._pool = pool
         self._config = config
@@ -483,7 +482,7 @@ class PgVectorDb(VectorDatabase):
         self._table_cache: Dict[tuple, PgVectorTable] = {}
 
         if isolation == IsolationType.LOGICAL:
-            self._schema = _validate_identifier(default_schema) if default_schema != "public" else "public"
+            self._schema = "public"
             self._datasource_id = namespace
         else:
             self._schema = _validate_identifier(namespace) if namespace else "public"
@@ -691,12 +690,10 @@ class PgvectorBackend(BaseVectorBackend):
         self._pool: Optional[ConnectionPool] = None
         self._pool_lock = threading.Lock()
         self._isolation: IsolationType = IsolationType.PHYSICAL
-        self._default_schema: str = "public"
 
     def initialize(self, config: Dict[str, Any]) -> None:
         self._config = config
         self._isolation = IsolationType(config.get("isolation", IsolationType.PHYSICAL.value))
-        self._default_schema = config.get("default_schema", "public")
 
     def _get_or_create_pool(self) -> ConnectionPool:
         """Return the shared connection pool, creating it on first use."""
@@ -762,7 +759,6 @@ class PgvectorBackend(BaseVectorBackend):
             config=self._config,
             namespace=namespace,
             isolation=self._isolation,
-            default_schema=self._default_schema,
         )
         self._connections.append(db)
         return db

@@ -306,7 +306,6 @@ class PgRdbDatabase(RdbDatabase):
         namespace: str = "",
         store_db_name: str = "",
         isolation: IsolationType = IsolationType.PHYSICAL,
-        default_schema: str = "public",
     ):
         self._pool = pool
         self._namespace = namespace
@@ -315,7 +314,7 @@ class PgRdbDatabase(RdbDatabase):
         self._local = threading.local()
 
         if isolation == IsolationType.LOGICAL:
-            self._schema = _validate_identifier(default_schema) if default_schema != "public" else "public"
+            self._schema = "public"
             self._datasource_id = namespace
         else:
             self._schema = _validate_identifier(namespace) if namespace else "public"
@@ -501,7 +500,6 @@ class PostgresRdbBackend(BaseRdbBackend):
         self._pool: Optional[ConnectionPool] = None
         self._pool_lock = threading.Lock()
         self._isolation: IsolationType = IsolationType.PHYSICAL
-        self._default_schema: str = "public"
 
     def initialize(self, config: Dict[str, Any]) -> None:
         _REQUIRED_KEYS = ("host", "port", "user", "password", "dbname")
@@ -510,7 +508,6 @@ class PostgresRdbBackend(BaseRdbBackend):
             raise ValueError(f"Missing required PostgreSQL config keys: {', '.join(missing)}")
         self._config = config
         self._isolation = IsolationType(config.get("isolation", IsolationType.PHYSICAL.value))
-        self._default_schema = config.get("default_schema", "public")
 
     def _get_or_create_pool(self) -> ConnectionPool:
         """Return the shared connection pool, creating it on first use."""
@@ -551,7 +548,6 @@ class PostgresRdbBackend(BaseRdbBackend):
             namespace=namespace,
             store_db_name=store_db_name,
             isolation=self._isolation,
-            default_schema=self._default_schema,
         )
         self._databases.append(db)
         return db

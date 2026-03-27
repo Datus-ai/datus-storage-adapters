@@ -19,7 +19,7 @@ from psycopg import sql as psql
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 
-from datus_storage_base.backend_config import IsolationType
+from datus_storage_base.backend_config import DATASOURCE_ID_COLUMN, IsolationType
 from datus_storage_base.conditions import WhereExpr, build_where
 from datus_storage_base.vector.base import BaseVectorBackend, EmbeddingFunction, VectorDatabase, VectorTable
 from datus_storage_postgresql.vector.schema_converter import schema_to_create_table_sql
@@ -27,8 +27,6 @@ from datus_storage_postgresql.vector.schema_converter import schema_to_create_ta
 logger = logging.getLogger(__name__)
 
 _SAFE_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-
-DATASOURCE_ID_COLUMN = "datasource_id"
 
 
 def _validate_identifier(name: str) -> str:
@@ -109,11 +107,11 @@ class PgVectorTable(VectorTable):
             compiled = where
         else:
             compiled = build_where(where)
-        combined = self._ds_where_clause(compiled)
+        combined, ds_params = self._ds_where_fragment(compiled)
         if combined:
             sql = f"DELETE FROM {self._table_name} WHERE {combined}"
             with self._pool.connection() as conn:
-                conn.execute(sql)
+                conn.execute(sql, ds_params or None)
                 conn.commit()
 
     def update(self, where: WhereExpr, values: Dict[str, Any]) -> None:
@@ -128,11 +126,11 @@ class PgVectorTable(VectorTable):
             set_parts.append(f"{col} = %s")
             params.append(val)
         set_clause = ", ".join(set_parts)
-        combined = self._ds_where_clause(compiled)
+        combined, ds_params = self._ds_where_fragment(compiled)
         where_clause = f" WHERE {combined}" if combined else ""
         sql = f"UPDATE {self._table_name} SET {set_clause}{where_clause}"
         with self._pool.connection() as conn:
-            conn.execute(sql, params)
+            conn.execute(sql, params + ds_params)
             conn.commit()
 
     # -- Search operations --
@@ -156,7 +154,7 @@ class PgVectorTable(VectorTable):
             compiled = where
         else:
             compiled = build_where(where)
-        combined = self._ds_where_clause(compiled)
+        combined, ds_params = self._ds_where_fragment(compiled)
         query_embedding = self._compute_query_embedding(query_text)
 
         columns = self._validate_select_fields(select_fields) if select_fields else self._select_columns()
@@ -166,7 +164,7 @@ class PgVectorTable(VectorTable):
             f"SELECT {columns} FROM {self._table_name} {where_clause} ORDER BY {vector_column} <=> %s::vector LIMIT %s"
         )
         with self._pool.connection() as conn:
-            rows = conn.execute(sql, (str(query_embedding), top_n)).fetchall()
+            rows = conn.execute(sql, ds_params + [str(query_embedding), top_n]).fetchall()
 
         return self._rows_to_arrow(rows, select_fields)
 
@@ -197,7 +195,7 @@ class PgVectorTable(VectorTable):
             compiled = where
         else:
             compiled = build_where(where)
-        combined = self._ds_where_clause(compiled)
+        combined, ds_params = self._ds_where_fragment(compiled)
         columns = self._validate_select_fields(select_fields) if select_fields else self._select_columns()
         where_clause = f"WHERE {combined}" if combined else ""
 
@@ -205,7 +203,7 @@ class PgVectorTable(VectorTable):
         sql = f"SELECT {columns} FROM {self._table_name} {where_clause} {limit_clause}"
 
         with self._pool.connection() as conn:
-            rows = conn.execute(sql).fetchall()
+            rows = conn.execute(sql, ds_params or None).fetchall()
 
         return self._rows_to_arrow(rows, select_fields)
 
@@ -214,11 +212,11 @@ class PgVectorTable(VectorTable):
             compiled = where
         else:
             compiled = build_where(where)
-        combined = self._ds_where_clause(compiled)
+        combined, ds_params = self._ds_where_fragment(compiled)
         where_clause = f"WHERE {combined}" if combined else ""
         sql = f"SELECT COUNT(*) AS cnt FROM {self._table_name} {where_clause}"
         with self._pool.connection() as conn:
-            row = conn.execute(sql).fetchone()
+            row = conn.execute(sql, ds_params or None).fetchone()
             if isinstance(row, dict):
                 return row["cnt"]
             return row[0] if row else 0
@@ -271,14 +269,19 @@ class PgVectorTable(VectorTable):
 
     # -- Private helpers --
 
-    def _ds_where_clause(self, existing_compiled: Optional[str] = None) -> str:
-        """Build WHERE clause fragment with datasource_id for logical isolation."""
+    def _ds_where_fragment(self, existing_compiled: Optional[str] = None) -> tuple:
+        """Build WHERE clause fragment with datasource_id for logical isolation.
+
+        Returns:
+            (clause_str, params_list) where clause_str may be empty and params
+            is a list of bind values for %s placeholders.
+        """
         if self._isolation != IsolationType.LOGICAL or self._datasource_id is None:
-            return existing_compiled or ""
-        ds_cond = f"{DATASOURCE_ID_COLUMN} = '{self._datasource_id}'"
+            return (existing_compiled or "", [])
+        ds_cond = f"{DATASOURCE_ID_COLUMN} = %s"
         if existing_compiled:
-            return f"{ds_cond} AND {existing_compiled}"
-        return ds_cond
+            return (f"{ds_cond} AND {existing_compiled}", [self._datasource_id])
+        return (ds_cond, [self._datasource_id])
 
     def _inject_datasource_df(self, df: pd.DataFrame) -> pd.DataFrame:
         """Add datasource_id column to DataFrame for logical isolation."""
@@ -389,10 +392,11 @@ class PgVectorTable(VectorTable):
         """Build the default SELECT column list, excluding datasource_id in logical mode."""
         if self._column_names:
             cols = self._column_names
-            if self._isolation == IsolationType.LOGICAL:
-                cols = [c for c in cols if c != DATASOURCE_ID_COLUMN]
-            return ", ".join(cols)
-        return "*"
+        else:
+            cols = []
+        if self._isolation == IsolationType.LOGICAL:
+            cols = [c for c in cols if c != DATASOURCE_ID_COLUMN]
+        return ", ".join(cols) if cols else "*"
 
     def _rows_to_arrow(
         self,

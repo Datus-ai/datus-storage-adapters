@@ -19,7 +19,7 @@ from psycopg import sql as psql
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 
-from datus_storage_base.backend_config import IsolationType
+from datus_storage_base.backend_config import DATASOURCE_ID_COLUMN, IsolationType
 from datus_storage_base.rdb.base import (
     BaseRdbBackend,
     ColumnDef,
@@ -36,8 +36,6 @@ from datus_storage_base.rdb.base import (
 )
 
 logger = logging.getLogger(__name__)
-
-DATASOURCE_ID_COLUMN = "datasource_id"
 
 _SAFE_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -97,8 +95,15 @@ def _pg_col_ddl(col: ColumnDef) -> str:
 class PgRdbTable(RdbTable):
     """PostgreSQL implementation of RdbTable (table-level CRUD)."""
 
-    def __init__(self, pool: ConnectionPool, qualified_name: str, local: threading.local, pk_column: str = "id",
-                 isolation: IsolationType = IsolationType.PHYSICAL, datasource_id: Optional[str] = None):
+    def __init__(
+        self,
+        pool: ConnectionPool,
+        qualified_name: str,
+        local: threading.local,
+        pk_column: str = "id",
+        isolation: IsolationType = IsolationType.PHYSICAL,
+        datasource_id: Optional[str] = None,
+    ):
         self._pool = pool
         self._qualified_name = qualified_name
         self._local = local
@@ -182,7 +187,9 @@ class PgRdbTable(RdbTable):
             columns = [_validate_identifier(k) for k in data.keys()]
             placeholders = ", ".join(["%s"] * len(columns))
             col_names = ", ".join(columns)
-            sql = f"INSERT INTO {self._qualified_name} ({col_names}) VALUES ({placeholders}) RETURNING {self._pk_column}"
+            sql = (
+                f"INSERT INTO {self._qualified_name} ({col_names}) VALUES ({placeholders}) RETURNING {self._pk_column}"
+            )
         try:
             with self._auto_conn() as conn:
                 cursor = conn.execute(sql, tuple(data.values()))
@@ -218,14 +225,12 @@ class PgRdbTable(RdbTable):
         with self._auto_conn() as conn:
             cursor = conn.execute(sql, params)
             rows = cursor.fetchall()
-            if self._isolation == IsolationType.LOGICAL:
-                results = []
-                for row in rows:
-                    row_dict = dict(row)
-                    row_dict.pop(DATASOURCE_ID_COLUMN, None)
-                    results.append(model(**row_dict))
-                return results
-            return [model(**dict(row)) for row in rows]
+            results = []
+            for row in rows:
+                row_dict = dict(row)
+                row_dict.pop(DATASOURCE_ID_COLUMN, None)
+                results.append(model(**row_dict))
+            return results
 
     def update(self, data: Dict[str, Any], where: Optional[WhereClause] = None) -> int:
         where = self._inject_datasource_where(where)
@@ -323,11 +328,7 @@ class PgRdbDatabase(RdbDatabase):
         # Ensure schema exists for non-public namespaces
         if self._schema != "public":
             with self._pool.connection() as conn:
-                conn.execute(
-                    psql.SQL("CREATE SCHEMA IF NOT EXISTS {}").format(
-                        psql.Identifier(self._schema)
-                    )
-                )
+                conn.execute(psql.SQL("CREATE SCHEMA IF NOT EXISTS {}").format(psql.Identifier(self._schema)))
                 conn.commit()
 
     @property
@@ -354,9 +355,7 @@ class PgRdbDatabase(RdbDatabase):
         col_parts.extend(table_def.constraints)
 
         create_table = (
-            f"CREATE TABLE IF NOT EXISTS {qualified_name} (\n"
-            + ",\n".join(f"    {p}" for p in col_parts)
-            + "\n)"
+            f"CREATE TABLE IF NOT EXISTS {qualified_name} (\n" + ",\n".join(f"    {p}" for p in col_parts) + "\n)"
         )
         statements.append(create_table)
 
@@ -364,9 +363,7 @@ class PgRdbDatabase(RdbDatabase):
             unique = "UNIQUE " if idx.unique else ""
             idx_name = _validate_identifier(idx.name)
             cols = ", ".join(_validate_identifier(c) for c in idx.columns)
-            statements.append(
-                f"CREATE {unique}INDEX IF NOT EXISTS {idx_name} ON {qualified_name}({cols})"
-            )
+            statements.append(f"CREATE {unique}INDEX IF NOT EXISTS {idx_name} ON {qualified_name}({cols})")
 
         return statements
 
@@ -380,15 +377,29 @@ class PgRdbDatabase(RdbDatabase):
                     col_type="TEXT",
                     nullable=False,
                 )
+                # Add datasource_id to unique indices so tenants don't conflict
+                patched_indices = []
+                for idx in table_def.indices:
+                    if idx.unique and DATASOURCE_ID_COLUMN not in idx.columns:
+                        patched_indices.append(
+                            IndexDef(
+                                name=idx.name,
+                                columns=list(idx.columns) + [DATASOURCE_ID_COLUMN],
+                                unique=True,
+                            )
+                        )
+                    else:
+                        patched_indices.append(idx)
+                patched_indices.append(
+                    IndexDef(
+                        name=f"idx_{table_def.table_name}_{DATASOURCE_ID_COLUMN}",
+                        columns=[DATASOURCE_ID_COLUMN],
+                    )
+                )
                 table_def = TableDefinition(
                     table_name=table_def.table_name,
                     columns=list(table_def.columns) + [extra_col],
-                    indices=list(table_def.indices) + [
-                        IndexDef(
-                            name=f"idx_{table_def.table_name}_{DATASOURCE_ID_COLUMN}",
-                            columns=[DATASOURCE_ID_COLUMN],
-                        )
-                    ],
+                    indices=patched_indices,
                     constraints=list(table_def.constraints),
                 )
 
@@ -403,8 +414,7 @@ class PgRdbDatabase(RdbDatabase):
             ddl_text = "\n".join(ddl_statements)
             logger.exception("Auto-create table '%s' failed", table_def.table_name)
             raise RuntimeError(
-                f"Failed to create table '{table_def.table_name}'. "
-                f"Please create it manually:\n\n{ddl_text}"
+                f"Failed to create table '{table_def.table_name}'. Please create it manually:\n\n{ddl_text}"
             ) from e
 
         pk_column = "id"
@@ -560,4 +570,3 @@ class PostgresRdbBackend(BaseRdbBackend):
             except Exception as e:
                 logger.warning("Error closing connection pool: %s", e)
             self._pool = None
-

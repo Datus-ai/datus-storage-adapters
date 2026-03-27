@@ -11,8 +11,12 @@ from typing import Any, Dict
 
 class IsolationType(str, Enum):
     """Controls how multi-tenant data isolation is implemented."""
+
     PHYSICAL = "physical"
     LOGICAL = "logical"
+
+
+DATASOURCE_ID_COLUMN = "datasource_id"
 
 
 @dataclass

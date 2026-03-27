@@ -5,7 +5,14 @@
 """Configuration dataclasses for storage backends."""
 
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any, Dict
+
+
+class IsolationType(str, Enum):
+    """Controls how multi-tenant data isolation is implemented."""
+    PHYSICAL = "physical"
+    LOGICAL = "logical"
 
 
 @dataclass
@@ -28,6 +35,8 @@ class VectorBackendConfig:
 class StorageBackendConfig:
     """Unified configuration for all storage backends."""
 
+    isolation: IsolationType = IsolationType.PHYSICAL
+    default_schema: str = "public"
     rdb: RdbBackendConfig = field(default_factory=RdbBackendConfig)
     vector: VectorBackendConfig = field(default_factory=VectorBackendConfig)
 
@@ -55,7 +64,13 @@ class StorageBackendConfig:
         rdb_type = rdb_section.pop("type", rdb_default)
         vector_type = vector_section.pop("type", vector_default)
 
+        isolation_str = storage_config.get("isolation", IsolationType.PHYSICAL.value)
+        isolation = IsolationType(isolation_str) if isinstance(isolation_str, str) else isolation_str
+        default_schema = storage_config.get("default_schema", "public")
+
         return StorageBackendConfig(
+            isolation=isolation,
+            default_schema=default_schema,
             rdb=RdbBackendConfig(type=rdb_type, params=rdb_section),
             vector=VectorBackendConfig(type=vector_type, params=vector_section),
         )

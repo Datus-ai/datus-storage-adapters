@@ -5,7 +5,7 @@ import pyarrow as pa
 import pytest
 from psycopg_pool import PoolClosed
 
-from datus.storage.conditions import eq, and_, or_, not_
+from datus_storage_base.conditions import eq, and_, or_, not_
 from datus_storage_postgresql.vector.backend import PgVectorDb, PgVectorTable, PgvectorBackend
 from conftest import MockEmbeddingFunction
 
@@ -150,9 +150,9 @@ class TestPgVectorDb:
         with pytest.raises(TypeError, match="Unsupported schema type"):
             db.create_table("fail_tbl2", schema={"bad": "schema"})
 
-    def test_open_table_cached(self, db, table):
+    def test_open_table_cached(self, db, table, embedding_function):
         """open_table returns the cached handle if available."""
-        opened = db.open_table("test_vectors")
+        opened = db.open_table("test_vectors", embedding_function=embedding_function)
         assert opened is table
 
     def test_open_table_uncached(self, db, test_schema, embedding_function):

@@ -651,3 +651,162 @@ class TestConvenienceMethods:
         with db.get_connection() as conn2:
             rows = db.execute_query(conn2, "SELECT name FROM test_items WHERE name = %s", ("p1",))
             assert len(rows) == 1
+
+
+# ==============================================================================
+# Logical isolation tests
+# ==============================================================================
+
+
+@pytest.fixture
+def logical_backend(pg_config):
+    """Create a PostgresRdbBackend with logical isolation."""
+    config = {**pg_config, "isolation": "logical"}
+    b = PostgresRdbBackend()
+    b.initialize(config)
+    yield b
+    b.close()
+
+
+@pytest.fixture
+def logical_db(logical_backend):
+    """Connect with a namespace under logical isolation."""
+    return logical_backend.connect(namespace="tenant_a", store_db_name="test")
+
+
+@pytest.fixture
+def logical_table(logical_db, test_table_def):
+    """Create table and clean data for logical isolation tests."""
+    table = logical_db.ensure_table(test_table_def)
+    # Clean any leftover data from previous tests
+    with logical_db.get_connection() as conn:
+        conn.execute("DELETE FROM test_items")
+        conn.commit()
+    return table
+
+
+class TestLogicalIsolation:
+
+    def test_table_in_public_schema(self, logical_db, test_table_def):
+        """Logical isolation uses public schema, not namespace as schema."""
+        table = logical_db.ensure_table(test_table_def)
+        assert table.table_name == "test_items"  # no schema prefix
+
+    def test_datasource_id_column_created(self, logical_db, test_table_def):
+        """ensure_table auto-adds datasource_id column."""
+        logical_db.ensure_table(test_table_def)
+        with logical_db.get_connection() as conn:
+            rows = logical_db.execute_query(
+                conn,
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name = %s AND column_name = %s",
+                ("test_items", "datasource_id"),
+            )
+            assert len(rows) == 1
+
+    def test_datasource_id_index_created(self, logical_db, test_table_def):
+        """ensure_table auto-creates B-tree index on datasource_id."""
+        logical_db.ensure_table(test_table_def)
+        with logical_db.get_connection() as conn:
+            rows = logical_db.execute_query(
+                conn,
+                "SELECT indexname FROM pg_indexes "
+                "WHERE tablename = %s AND indexname LIKE %s",
+                ("test_items", "%datasource_id%"),
+            )
+            assert len(rows) >= 1
+
+    def test_insert_injects_datasource_id(self, logical_db, logical_table):
+        """Insert auto-injects datasource_id = namespace."""
+        logical_table.insert(TestItem(name="li1", value="v1"))
+        with logical_db.get_connection() as conn:
+            rows = logical_db.execute_query(
+                conn,
+                "SELECT datasource_id FROM test_items WHERE name = %s",
+                ("li1",),
+            )
+            assert rows[0]["datasource_id"] == "tenant_a"
+
+    def test_query_filters_by_datasource_id(self, logical_backend, test_table_def):
+        """Query only returns rows for the connected namespace."""
+        db_a = logical_backend.connect(namespace="tenant_a", store_db_name="test")
+        db_b = logical_backend.connect(namespace="tenant_b", store_db_name="test")
+
+        tbl_a = db_a.ensure_table(test_table_def)
+        tbl_b = db_b.ensure_table(test_table_def)
+
+        # Clean slate
+        with db_a.get_connection() as conn:
+            conn.execute("DELETE FROM test_items")
+            conn.commit()
+
+        tbl_a.insert(TestItem(name="a1", value="from_a"))
+        tbl_b.insert(TestItem(name="b1", value="from_b"))
+        tbl_b.insert(TestItem(name="b2", value="from_b"))
+
+        assert len(tbl_a.query(TestItem)) == 1
+        assert len(tbl_b.query(TestItem)) == 2
+
+    def test_update_scoped_to_datasource(self, logical_backend, test_table_def):
+        """Update only affects rows for the connected namespace."""
+        db_a = logical_backend.connect(namespace="tenant_a", store_db_name="test")
+        db_b = logical_backend.connect(namespace="tenant_b", store_db_name="test")
+
+        tbl_a = db_a.ensure_table(test_table_def)
+        tbl_b = db_b.ensure_table(test_table_def)
+
+        # Clean slate
+        with db_a.get_connection() as conn:
+            conn.execute("DELETE FROM test_items")
+            conn.commit()
+
+        tbl_a.insert(TestItem(name="ua1", value="old"))
+        tbl_b.insert(TestItem(name="ub1", value="old"))
+
+        count = tbl_a.update({"value": "new"})
+        assert count == 1
+        assert tbl_a.query(TestItem)[0].value == "new"
+        assert tbl_b.query(TestItem)[0].value == "old"
+
+    def test_delete_scoped_to_datasource(self, logical_backend, test_table_def):
+        """Delete only affects rows for the connected namespace."""
+        db_a = logical_backend.connect(namespace="tenant_a", store_db_name="test")
+        db_b = logical_backend.connect(namespace="tenant_b", store_db_name="test")
+
+        tbl_a = db_a.ensure_table(test_table_def)
+        tbl_b = db_b.ensure_table(test_table_def)
+
+        # Clean slate
+        with db_a.get_connection() as conn:
+            conn.execute("DELETE FROM test_items")
+            conn.commit()
+
+        tbl_a.insert(TestItem(name="da1", value="v"))
+        tbl_b.insert(TestItem(name="db1", value="v"))
+
+        tbl_a.delete()
+        assert len(tbl_a.query(TestItem)) == 0
+        assert len(tbl_b.query(TestItem)) == 1
+
+    def test_upsert_injects_datasource_id(self, logical_db):
+        """Upsert auto-injects datasource_id."""
+        table_def = TableDefinition(
+            table_name="logical_upsert",
+            columns=[
+                ColumnDef(name="key_col", col_type="TEXT", primary_key=True),
+                ColumnDef(name="data", col_type="TEXT"),
+            ],
+        )
+        table = logical_db.ensure_table(table_def)
+        table.upsert(UpsertRecord(key_col="k1", data="d1"), ["key_col"])
+        results = table.query(UpsertRecord)
+        assert len(results) == 1
+        assert results[0].data == "d1"
+
+    def test_query_result_excludes_datasource_id(self, logical_table, test_table_def):
+        """Query results should not include datasource_id in model fields."""
+        logical_table.insert(TestItem(name="excl1", value="v1"))
+        results = logical_table.query(TestItem)
+        assert len(results) == 1
+        # TestItem has fields: id, name, value, score — no datasource_id
+        assert isinstance(results[0], TestItem)

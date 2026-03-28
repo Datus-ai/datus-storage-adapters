@@ -137,16 +137,15 @@ class PgvectorTestEnv(VectorTestEnv):
         )
         with psycopg.connect(conninfo, autocommit=True) as conn:
             if self._isolation == IsolationType.LOGICAL:
-                schema = "public"
+                # Delete rows by datasource_id only in tables that have the column
                 rows = conn.execute(
-                    "SELECT tablename FROM pg_tables WHERE schemaname = %s",
-                    (schema,),
+                    "SELECT table_name FROM information_schema.columns "
+                    "WHERE table_schema = 'public' AND column_name = 'datasource_id'",
                 ).fetchall()
                 for row in rows:
-                    tbl = row[0] if not isinstance(row, dict) else row["tablename"]
-                    qualified = f"{schema}.{tbl}" if schema != "public" else tbl
+                    tbl = row[0] if not isinstance(row, dict) else row["table_name"]
                     conn.execute(
-                        f"DELETE FROM {qualified} WHERE datasource_id = %s",
+                        f'DELETE FROM "{tbl}" WHERE datasource_id = %s',
                         (namespace,),
                     )
             else:

@@ -26,16 +26,15 @@ Location: `datus_storage_base/backend_config.py`
 @dataclass
 class StorageBackendConfig:
     isolation: IsolationType = IsolationType.PHYSICAL  # default = backward compatible
-    default_schema: str = "public"  # used by logical isolation
     rdb: RdbBackendConfig = field(default_factory=RdbBackendConfig)
     vector: VectorBackendConfig = field(default_factory=VectorBackendConfig)
 ```
 
-`from_dict()` parses top-level `isolation` and `default_schema` keys.
+`from_dict()` parses the top-level `isolation` key.
 
 ### Config propagation
 
-`isolation` and `default_schema` are passed into the backend `config` dict (alongside host/port/etc). Backends read them in `initialize()` and store them. `connect()` uses them to decide behavior.
+`isolation` is passed into the backend `config` dict (alongside host/port/etc). Backends read it in `initialize()` and store it. `connect()` uses it to decide behavior. Logical isolation always uses the `public` schema.
 
 ## Behavior by Mode
 
@@ -48,7 +47,7 @@ class StorageBackendConfig:
 
 ### Logical Isolation
 
-- `connect(namespace)` uses `default_schema` (default `public`), ignores namespace for schema creation
+- `connect(namespace)` uses `public` schema, ignores namespace for schema creation
 - `datasource_id` column (TEXT, NOT NULL) auto-injected into every table
 - B-tree index auto-created on `datasource_id`
 - `datasource_id` value = namespace passed to `connect()`
@@ -58,7 +57,7 @@ class StorageBackendConfig:
 
 ### PgRdbDatabase (logical mode)
 
-- Constructor: schema = `default_schema` instead of namespace
+- Constructor: schema = `public` instead of namespace
 - `ensure_table(table_def)`: appends `datasource_id TEXT NOT NULL` to column list, adds B-tree index `idx_{table}_{datasource_id}`
 - Stores namespace as `self._datasource_id` for passing to table handles
 
@@ -80,7 +79,7 @@ Implementation approach: the table receives an `isolation_type` and `datasource_
 
 ### PgVectorDb (logical mode)
 
-- Constructor: schema = `default_schema` instead of namespace
+- Constructor: schema = `public` instead of namespace
 - `create_table()`: appends `datasource_id` (string, not null) to PyArrow schema before generating DDL, adds B-tree index
 - Stores namespace as datasource_id for passing to table handles
 

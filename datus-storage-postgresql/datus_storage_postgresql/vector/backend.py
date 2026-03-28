@@ -115,6 +115,8 @@ class PgVectorTable(VectorTable):
                 conn.commit()
 
     def update(self, where: WhereExpr, values: Dict[str, Any]) -> None:
+        if self._isolation == IsolationType.LOGICAL and DATASOURCE_ID_COLUMN in values:
+            raise ValueError(f"{DATASOURCE_ID_COLUMN} is managed internally and cannot be updated")
         if isinstance(where, str):
             compiled = where
         else:
@@ -284,12 +286,11 @@ class PgVectorTable(VectorTable):
         return (ds_cond, [self._datasource_id])
 
     def _inject_datasource_df(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Add datasource_id column to DataFrame for logical isolation."""
+        """Force datasource_id column on DataFrame for logical isolation."""
         if self._isolation != IsolationType.LOGICAL or self._datasource_id is None:
             return df
-        if DATASOURCE_ID_COLUMN not in df.columns:
-            df = df.copy()
-            df[DATASOURCE_ID_COLUMN] = self._datasource_id
+        df = df.copy()
+        df[DATASOURCE_ID_COLUMN] = self._datasource_id
         return df
 
     def _compute_embeddings_for_insert(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -357,20 +358,27 @@ class PgVectorTable(VectorTable):
         for c in columns:
             _validate_identifier(c)
         _validate_identifier(on_column)
+
+        # In logical mode, scope conflict target to tenant
+        if self._isolation == IsolationType.LOGICAL and self._datasource_id is not None:
+            conflict_target = f"{on_column}, {DATASOURCE_ID_COLUMN}"
+        else:
+            conflict_target = on_column
+
         col_names = ", ".join(columns)
         placeholders = ", ".join(["%s"] * len(columns))
-        update_cols = [c for c in columns if c != on_column]
+        update_cols = [c for c in columns if c != on_column and c != DATASOURCE_ID_COLUMN]
         update_set = ", ".join(f"{c} = EXCLUDED.{c}" for c in update_cols)
 
         if update_set:
             sql = (
                 f"INSERT INTO {self._table_name} ({col_names}) VALUES ({placeholders}) "
-                f"ON CONFLICT ({on_column}) DO UPDATE SET {update_set}"
+                f"ON CONFLICT ({conflict_target}) DO UPDATE SET {update_set}"
             )
         else:
             sql = (
                 f"INSERT INTO {self._table_name} ({col_names}) VALUES ({placeholders}) "
-                f"ON CONFLICT ({on_column}) DO NOTHING"
+                f"ON CONFLICT ({conflict_target}) DO NOTHING"
             )
 
         rows = []
@@ -555,11 +563,20 @@ class PgVectorDb(VectorDatabase):
 
             with self._pool.connection() as conn:
                 conn.execute(ddl)
-                # Create B-tree index on datasource_id for logical isolation
+                # Create indexes for logical isolation
                 if self._isolation == IsolationType.LOGICAL:
                     table_token = table_name
                     idx_name = f"idx_{table_token}_{DATASOURCE_ID_COLUMN}"
                     conn.execute(f"CREATE INDEX IF NOT EXISTS {idx_name} ON {qualified} ({DATASOURCE_ID_COLUMN})")
+                    # Create composite unique indexes for upsert conflict targets
+                    if unique_columns:
+                        for ucol in unique_columns:
+                            _validate_identifier(ucol)
+                            comp_idx = f"idx_{table_token}_{ucol}_{DATASOURCE_ID_COLUMN}_uq"
+                            conn.execute(
+                                f"CREATE UNIQUE INDEX IF NOT EXISTS {comp_idx} "
+                                f"ON {qualified} ({ucol}, {DATASOURCE_ID_COLUMN})"
+                            )
                 conn.commit()
         elif not exist_ok:
             raise ValueError(f"Schema is required to create table '{table_name}'")

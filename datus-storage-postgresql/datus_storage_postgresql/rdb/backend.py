@@ -233,6 +233,8 @@ class PgRdbTable(RdbTable):
             return results
 
     def update(self, data: Dict[str, Any], where: Optional[WhereClause] = None) -> int:
+        if self._isolation == IsolationType.LOGICAL and DATASOURCE_ID_COLUMN in data:
+            raise ValueError(f"{DATASOURCE_ID_COLUMN} is managed internally and cannot be updated")
         where = self._inject_datasource_where(where)
         if not data:
             return 0
@@ -268,6 +270,9 @@ class PgRdbTable(RdbTable):
         data = self._inject_datasource_into_record(data)
         if not data:
             raise ValueError("Cannot upsert a record with no non-None fields")
+        # In logical mode, scope conflict target to tenant
+        if self._isolation == IsolationType.LOGICAL and DATASOURCE_ID_COLUMN not in conflict_columns:
+            conflict_columns = list(conflict_columns) + [DATASOURCE_ID_COLUMN]
         columns = [_validate_identifier(k) for k in data.keys()]
         placeholders = ", ".join(["%s"] * len(columns))
         col_names = ", ".join(columns)
@@ -390,6 +395,17 @@ class PgRdbDatabase(RdbDatabase):
                         )
                     else:
                         patched_indices.append(idx)
+                # Add composite unique index for PK + datasource_id (needed for upsert ON CONFLICT)
+                pk_cols = [c.name for c in table_def.columns if c.primary_key]
+                if pk_cols:
+                    patched_indices.append(
+                        IndexDef(
+                            name=f"idx_{table_def.table_name}_pk_{DATASOURCE_ID_COLUMN}",
+                            columns=pk_cols + [DATASOURCE_ID_COLUMN],
+                            unique=True,
+                        )
+                    )
+                # Add standalone datasource_id index for filtering
                 patched_indices.append(
                     IndexDef(
                         name=f"idx_{table_def.table_name}_{DATASOURCE_ID_COLUMN}",

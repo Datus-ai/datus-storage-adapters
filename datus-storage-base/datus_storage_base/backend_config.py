@@ -67,8 +67,15 @@ class StorageBackendConfig:
         rdb_type = rdb_section.pop("type", rdb_default)
         vector_type = vector_section.pop("type", vector_default)
 
-        isolation_str = storage_config.get("isolation", IsolationType.PHYSICAL.value)
-        isolation = IsolationType(isolation_str) if isinstance(isolation_str, str) else isolation_str
+        isolation_raw = storage_config.get("isolation", IsolationType.PHYSICAL.value)
+        if isinstance(isolation_raw, str):
+            isolation = IsolationType(isolation_raw)
+        elif isinstance(isolation_raw, IsolationType):
+            isolation = isolation_raw
+        else:
+            raise TypeError(
+                f"isolation must be a str or IsolationType, got {type(isolation_raw).__name__}: {isolation_raw!r}"
+            )
 
         return StorageBackendConfig(
             isolation=isolation,

@@ -39,7 +39,7 @@ class VectorBackendConfig:
 class StorageBackendConfig:
     """Unified configuration for all storage backends."""
 
-    isolation: IsolationType = IsolationType.LOGICAL
+    isolation: IsolationType = IsolationType.PHYSICAL
     rdb: RdbBackendConfig = field(default_factory=RdbBackendConfig)
     vector: VectorBackendConfig = field(default_factory=VectorBackendConfig)
 

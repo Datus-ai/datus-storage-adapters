@@ -282,7 +282,7 @@ class PgVectorTable(VectorTable):
             return (existing_compiled or "", [])
         ds_cond = f"{DATASOURCE_ID_COLUMN} = %s"
         if existing_compiled:
-            return (f"{ds_cond} AND {existing_compiled}", [self._datasource_id])
+            return (f"{ds_cond} AND ({existing_compiled})", [self._datasource_id])
         return (ds_cond, [self._datasource_id])
 
     def _inject_datasource_df(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -396,14 +396,17 @@ class PgVectorTable(VectorTable):
                 cur.executemany(sql, rows)
             conn.commit()
 
-    def _select_columns(self) -> str:
-        """Build the default SELECT column list, excluding datasource_id in logical mode."""
-        if self._column_names:
-            cols = self._column_names
-        else:
-            cols = []
+    @property
+    def _default_columns(self) -> List[str]:
+        """Return column names filtered for the current isolation mode."""
+        cols = self._column_names
         if self._isolation == IsolationType.LOGICAL:
             cols = [c for c in cols if c != DATASOURCE_ID_COLUMN]
+        return cols
+
+    def _select_columns(self) -> str:
+        """Build the default SELECT column list, excluding datasource_id in logical mode."""
+        cols = self._default_columns
         return ", ".join(cols) if cols else "*"
 
     def _rows_to_arrow(
@@ -412,6 +415,7 @@ class PgVectorTable(VectorTable):
         select_fields: Optional[List[str]] = None,
     ) -> pa.Table:
         """Convert fetched rows (list of dicts) to a PyArrow Table."""
+        default_cols = self._default_columns
         if not rows:
             if select_fields:
                 arrays = {
@@ -423,7 +427,7 @@ class PgVectorTable(VectorTable):
                     )
                     for f in select_fields
                 }
-            elif self._column_names:
+            elif default_cols:
                 arrays = {
                     c: pa.array(
                         [],
@@ -431,7 +435,7 @@ class PgVectorTable(VectorTable):
                         if c == self._vector_column
                         else pa.string(),
                     )
-                    for c in self._column_names
+                    for c in default_cols
                 }
             else:
                 return pa.table({})
@@ -440,7 +444,7 @@ class PgVectorTable(VectorTable):
         if isinstance(rows[0], dict):
             col_names = select_fields or list(rows[0].keys())
         else:
-            col_names = select_fields or self._column_names
+            col_names = select_fields or default_cols
 
         arrays = {}
         for idx, col in enumerate(col_names):
@@ -662,6 +666,12 @@ class PgVectorDb(VectorDatabase):
         return self.open_table(table_name, embedding_function, vector_column, source_column)
 
     def drop_table(self, table_name: str, ignore_missing: bool = False) -> None:
+        if self._isolation == IsolationType.LOGICAL:
+            raise RuntimeError(
+                f"drop_table('{table_name}') is not allowed in logical isolation mode "
+                "because the table is shared across all tenants. "
+                "Use delete() with a datasource_id filter to remove tenant data."
+            )
         qualified = self._qualified(table_name)
         if_exists = "IF EXISTS " if ignore_missing else ""
         sql = f"DROP TABLE {if_exists}{qualified}"

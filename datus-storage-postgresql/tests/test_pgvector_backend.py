@@ -488,10 +488,17 @@ def logical_db(logical_backend):
     return logical_backend.connect("tenant_a")
 
 
+def _drop_table_raw(pool, table_name):
+    """Drop a table directly via pool, bypassing logical isolation guard (test-only)."""
+    with pool.connection() as conn:
+        conn.execute(f"DROP TABLE IF EXISTS {table_name}")
+        conn.commit()
+
+
 @pytest.fixture
 def logical_table(logical_db, test_schema, embedding_function):
     """Create a test table under logical isolation."""
-    logical_db.drop_table("logical_vectors", ignore_missing=True)
+    _drop_table_raw(logical_db.pool, "logical_vectors")
     tbl = logical_db.create_table(
         "logical_vectors",
         schema=test_schema,
@@ -529,7 +536,7 @@ class TestVectorLogicalIsolation:
         db_a = logical_backend.connect("tenant_a")
         db_b = logical_backend.connect("tenant_b")
 
-        db_a.drop_table("shared_vec", ignore_missing=True)
+        _drop_table_raw(db_a.pool, "shared_vec")
         tbl_a = db_a.create_table("shared_vec", schema=test_schema, embedding_function=embedding_function)
         tbl_b = db_b.open_table("shared_vec", embedding_function=embedding_function)
 
@@ -544,7 +551,7 @@ class TestVectorLogicalIsolation:
         db_a = logical_backend.connect("tenant_a")
         db_b = logical_backend.connect("tenant_b")
 
-        db_a.drop_table("del_vec", ignore_missing=True)
+        _drop_table_raw(db_a.pool, "del_vec")
         tbl_a = db_a.create_table("del_vec", schema=test_schema, embedding_function=embedding_function)
         tbl_b = db_b.open_table("del_vec", embedding_function=embedding_function)
 
@@ -560,7 +567,7 @@ class TestVectorLogicalIsolation:
         db_a = logical_backend.connect("tenant_a")
         db_b = logical_backend.connect("tenant_b")
 
-        db_a.drop_table("upd_vec", ignore_missing=True)
+        _drop_table_raw(db_a.pool, "upd_vec")
         tbl_a = db_a.create_table("upd_vec", schema=test_schema, embedding_function=embedding_function)
         tbl_b = db_b.open_table("upd_vec", embedding_function=embedding_function)
 

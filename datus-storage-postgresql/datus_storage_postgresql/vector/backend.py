@@ -367,7 +367,10 @@ class PgVectorTable(VectorTable):
 
         col_names = ", ".join(columns)
         placeholders = ", ".join(["%s"] * len(columns))
-        update_cols = [c for c in columns if c != on_column and c != DATASOURCE_ID_COLUMN]
+        skip_cols = {on_column}
+        if self._isolation == IsolationType.LOGICAL:
+            skip_cols.add(DATASOURCE_ID_COLUMN)
+        update_cols = [c for c in columns if c not in skip_cols]
         update_set = ", ".join(f"{c} = EXCLUDED.{c}" for c in update_cols)
 
         if update_set:

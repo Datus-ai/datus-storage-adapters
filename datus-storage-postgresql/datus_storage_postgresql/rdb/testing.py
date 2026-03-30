@@ -95,7 +95,10 @@ class PostgresRdbTestEnv(RdbTestEnv):
                         conn.execute(sql.SQL("DROP TABLE IF EXISTS {} CASCADE").format(sql.Identifier(tbl)))
 
     def get_config(self) -> TestEnvConfig:
-        return TestEnvConfig(backend_type="postgresql", params=dict(self._config or {}))
+        params = dict(self._config or {})
+        if self._isolation != IsolationType.PHYSICAL:
+            params["isolation"] = self._isolation.value
+        return TestEnvConfig(backend_type="postgresql", params=params)
 
 
 def create_test_env() -> PostgresRdbTestEnv:

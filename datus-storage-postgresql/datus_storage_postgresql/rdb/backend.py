@@ -421,6 +421,17 @@ class PgRdbDatabase(RdbDatabase):
 
         qualified = self._qualified(table_def.table_name)
         ddl_statements = self._generate_ddl(qualified, table_def)
+
+        # For logical isolation, ensure datasource_id exists on pre-existing tables.
+        # CREATE TABLE IF NOT EXISTS is a no-op when the table already exists, so the
+        # column would be missing and subsequent CREATE INDEX statements would fail.
+        if self._isolation == IsolationType.LOGICAL:
+            ddl_statements.insert(
+                1,
+                f"ALTER TABLE {qualified} "
+                f"ADD COLUMN IF NOT EXISTS {DATASOURCE_ID_COLUMN} TEXT NOT NULL DEFAULT ''",
+            )
+
         try:
             with self._pool.connection() as conn:
                 for stmt in ddl_statements:

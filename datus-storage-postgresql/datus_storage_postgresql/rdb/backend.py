@@ -69,8 +69,6 @@ def _pg_col_ddl(col: ColumnDef) -> str:
 
     if col.primary_key and col.autoincrement:
         parts.append("SERIAL PRIMARY KEY")
-    elif col.autoincrement:
-        parts.append("SERIAL")
     else:
         parts.append(_pg_map_type(col.col_type))
         if col.primary_key:
@@ -384,30 +382,6 @@ class PgRdbDatabase(RdbDatabase):
                     col_type="TEXT",
                     nullable=False,
                 )
-                # Strip primary_key from original columns — PK becomes composite
-                pk_cols = [c.name for c in table_def.columns if c.primary_key]
-                patched_columns = []
-                for col in table_def.columns:
-                    if col.primary_key:
-                        patched_columns.append(ColumnDef(
-                            name=col.name,
-                            col_type=col.col_type,
-                            primary_key=False,
-                            autoincrement=col.autoincrement,
-                            nullable=col.nullable,
-                            default=col.default,
-                            unique=False,  # uniqueness handled by composite PK
-                        ))
-                    else:
-                        patched_columns.append(col)
-                patched_columns.append(extra_col)
-
-                # Add composite PRIMARY KEY constraint
-                patched_constraints = list(table_def.constraints)
-                if pk_cols:
-                    pk_str = ", ".join(_validate_identifier(c) for c in pk_cols + [DATASOURCE_ID_COLUMN])
-                    patched_constraints.append(f"PRIMARY KEY ({pk_str})")
-
                 # Add datasource_id to unique indices so tenants don't conflict
                 patched_indices = []
                 for idx in table_def.indices:
@@ -421,6 +395,16 @@ class PgRdbDatabase(RdbDatabase):
                         )
                     else:
                         patched_indices.append(idx)
+                # Add composite unique index for PK + datasource_id (needed for upsert ON CONFLICT)
+                pk_cols = [c.name for c in table_def.columns if c.primary_key]
+                if pk_cols:
+                    patched_indices.append(
+                        IndexDef(
+                            name=f"idx_{table_def.table_name}_pk_{DATASOURCE_ID_COLUMN}",
+                            columns=pk_cols + [DATASOURCE_ID_COLUMN],
+                            unique=True,
+                        )
+                    )
                 # Add standalone datasource_id index for filtering
                 patched_indices.append(
                     IndexDef(
@@ -430,9 +414,9 @@ class PgRdbDatabase(RdbDatabase):
                 )
                 table_def = TableDefinition(
                     table_name=table_def.table_name,
-                    columns=patched_columns,
+                    columns=list(table_def.columns) + [extra_col],
                     indices=patched_indices,
-                    constraints=patched_constraints,
+                    constraints=list(table_def.constraints),
                 )
 
         qualified = self._qualified(table_def.table_name)

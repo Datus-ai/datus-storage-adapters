@@ -34,7 +34,7 @@ jobs:
     environment: Pypi Publish
     steps:
       - name: Checkout latest main
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           ref: main
           fetch-depth: 0
@@ -42,12 +42,12 @@ jobs:
           token: ${{ secrets.RELEASE_BOT_TOKEN || secrets.GITHUB_TOKEN }}
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.12"
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
         with:
           enable-cache: true
 
@@ -76,16 +76,20 @@ jobs:
           requested_version = os.environ.get("REQUESTED_VERSION", "").strip()
 
 
-          def load_workspace_packages() -> dict[str, Version]:
+          def load_workspace_packages() -> dict[str, dict]:
               root = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
               members = root.get("tool", {}).get("uv", {}).get("workspace", {}).get("members", [])
               if not members:
                   raise ValueError("No tool.uv.workspace.members found in root pyproject.toml")
-              packages: dict[str, Version] = {}
+              packages: dict[str, dict] = {}
               for member in members:
-                  pyproject = tomllib.loads((Path(member) / "pyproject.toml").read_text(encoding="utf-8"))
+                  member_path = Path(member)
+                  pyproject = tomllib.loads((member_path / "pyproject.toml").read_text(encoding="utf-8"))
                   project = pyproject["project"]
-                  packages[str(project["name"])] = Version(str(project["version"]))
+                  packages[str(project["name"])] = {
+                      "path": member_path,
+                      "version": Version(str(project["version"])),
+                  }
               return packages
 
 
@@ -120,7 +124,7 @@ jobs:
               available = ", ".join(sorted(packages))
               raise ValueError(f"Unknown package {package_name!r}. Available packages: {available}")
 
-          current_version = packages[package_name]
+          current_version = packages[package_name]["version"]
           latest_version = latest_pypi_version(package_name)
 
           if requested_version and requested_version.lower() != "auto":
@@ -145,6 +149,9 @@ jobs:
               print(f"version={target_version}", file=output)
               print(f"tag={package_name}-v{target_version}", file=output)
               print(f"all_packages={' '.join(packages)}", file=output)
+              print(f"package_path={packages[package_name]['path']}", file=output)
+              pyproject_paths = " ".join(str(info["path"] / "pyproject.toml") for info in packages.values())
+              print(f"pyproject_paths={pyproject_paths}", file=output)
 
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
               print(f"### {package_name} release", file=summary)
@@ -166,6 +173,9 @@ jobs:
           import re
           import tomllib
           from pathlib import Path
+
+          from packaging.requirements import InvalidRequirement, Requirement
+          from packaging.utils import canonicalize_name
 
           package_name = os.environ["PACKAGE"]
           version = os.environ["VERSION"]
@@ -197,12 +207,35 @@ jobs:
               raise ValueError(f"Unable to find [project] version in {path}")
 
 
+          def bump_lower_bound(requirement_text: str) -> str | None:
+              """Raise the >= bound to the release version, keeping extras, other
+              specifiers (upper bounds, exclusions), and environment markers."""
+              try:
+                  requirement = Requirement(requirement_text)
+              except InvalidRequirement:
+                  return None
+              if canonicalize_name(requirement.name) != canonicalize_name(package_name):
+                  return None
+              specifiers = [str(spec) for spec in requirement.specifier if spec.operator not in (">=", ">")]
+              specifiers.insert(0, f">={version}")
+              extras = f"[{','.join(sorted(requirement.extras))}]" if requirement.extras else ""
+              marker = ""
+              if requirement.marker:
+                  # packaging serializes marker values with double quotes, which would
+                  # terminate the surrounding TOML string; PEP 508 allows single quotes.
+                  marker = "; " + str(requirement.marker).replace('"', "'")
+              return f"{requirement.name}{extras}{','.join(specifiers)}{marker}"
+
+
           def update_dependency_bound(path: Path) -> bool:
               content = path.read_text(encoding="utf-8")
 
               def fix_block(match: re.Match[str]) -> str:
-                  pattern = rf'"({re.escape(package_name)})(?:\[[^"\]]*\])?(?:[<>=!~][^"]*)?"'
-                  return re.sub(pattern, rf'"\g<1>>={version}"', match.group(0))
+                  def fix_requirement(requirement_match: re.Match[str]) -> str:
+                      replacement = bump_lower_bound(requirement_match.group(1))
+                      return f'"{replacement}"' if replacement else requirement_match.group(0)
+
+                  return re.sub(r'"([^"]+)"', fix_requirement, match.group(0))
 
               # Only rewrite [project] dependencies arrays; quoted package names may
               # also appear in other sections that must stay untouched.
@@ -226,6 +259,7 @@ jobs:
       - name: Build and validate release artifacts
         env:
           PACKAGE: ${{ steps.resolve.outputs.package }}
+          PACKAGE_PATH: ${{ steps.resolve.outputs.package_path }}
           VERSION: ${{ steps.resolve.outputs.version }}
           ALL_PACKAGES: ${{ steps.resolve.outputs.all_packages }}
         run: |
@@ -247,11 +281,11 @@ jobs:
           uv run --no-project --isolated "${with_args[@]}" \
             python -c "import ${PACKAGE//-/_}; print('import smoke passed for ${PACKAGE}')"
 
-          if [ -e "${PACKAGE}/tests/unit" ]; then
+          if [ -e "${PACKAGE_PATH}/tests/unit" ]; then
             echo "=== Unit tests: ${PACKAGE} ==="
-            uv run --all-packages --with pytest pytest "${PACKAGE}/tests/unit" -m "not integration" --tb=short
+            uv run --all-packages --with pytest pytest "${PACKAGE_PATH}/tests/unit" -m "not integration" --tb=short
           else
-            echo "Skipping unit tests: ${PACKAGE}/tests/unit does not exist"
+            echo "Skipping unit tests: ${PACKAGE_PATH}/tests/unit does not exist"
           fi
 
           git diff --check
@@ -262,6 +296,7 @@ jobs:
           PACKAGE: ${{ steps.resolve.outputs.package }}
           VERSION: ${{ steps.resolve.outputs.version }}
           TAG: ${{ steps.resolve.outputs.tag }}
+          PYPROJECT_PATHS: ${{ steps.resolve.outputs.pyproject_paths }}
         run: |
           set -euo pipefail
 
@@ -270,7 +305,9 @@ jobs:
           git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
 
           git diff --check
-          git add -- ./*/pyproject.toml
+          # PYPROJECT_PATHS comes from the resolved workspace members; word
+          # splitting is intentional (paths contain no spaces).
+          git add -- ${PYPROJECT_PATHS}
           if git diff --cached --quiet; then
             echo "${PACKAGE} already declares ${VERSION}"
           else

@@ -26,13 +26,15 @@ Implements `BaseVectorBackend` using the [pgvector](https://github.com/pgvector/
 
 - **`PgvectorBackend`** (lifecycle): `initialize()`, `connect(namespace)`, `build_embedding_config()`, `close()`
 - **`PgVectorDb`** (database-level, implements `VectorDatabase`): `table_exists()`, `table_names()`, `create_table()`, `open_table()`, `drop_table()`
-- **`PgVectorTable`** (table-level, implements `VectorTable`): `add()`, `merge_insert()`, `delete()`, `update()`, `search_vector()`, `search_hybrid()`, `search_all()`, `count_rows()`, index operations
+- **`PgVectorTable`** (table-level, implements `VectorTable`): `add()`, `merge_insert()`, `delete()`, `update()`, `search_vector()`, `search_hybrid()`, `search_fts()`, `search_all()`, `count_rows()`, index operations
 
 Features:
 - `WhereExpr` support (condition AST nodes or `None`) via `build_where()`
 - Vector similarity search (cosine / L2 / inner product)
 - Automatic embedding computation on insert
-- HNSW vector index, B-tree scalar index, GIN full-text index
+- HNSW vector index, B-tree scalar index, native GIN full-text indexes
+- Weighted multi-field FTS with `simple`, `whitespace`, `raw`, and Unicode `ngram` field configurations
+- Strict FTS index version/status checks and automatic transactional index maintenance on incremental writes
 - PyArrow Schema to PostgreSQL DDL mapping
 
 ## Configuration
@@ -73,7 +75,7 @@ storage:
 | `pool_min_size` | No | `1` | Minimum connections in pool |
 | `pool_max_size` | No | `10` | Maximum connections in pool |
 
-The vector backend automatically enables the pgvector extension (`CREATE EXTENSION IF NOT EXISTS vector`) on connect.
+Extensions are enabled lazily. Vector tables require `vector`, while `raw` substring FTS fields require `pg_trgm`. Native `simple`, `whitespace`, and `ngram` FTS do not require an extension, and text-only FTS does not require pgvector.
 
 ## Usage
 

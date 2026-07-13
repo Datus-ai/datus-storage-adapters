@@ -16,6 +16,7 @@ import threading
 from dataclasses import asdict
 from typing import Any, Dict, List, Optional
 
+import numpy as np
 import pandas as pd
 import pyarrow as pa
 from psycopg import sql as psql
@@ -44,6 +45,20 @@ def _validate_identifier(name: str) -> str:
     if not _SAFE_IDENTIFIER.match(name):
         raise ValueError(f"Invalid SQL identifier: {name!r}")
     return name
+
+
+def _to_postgres_value(value: Any) -> Any:
+    """Convert dataframe scalar wrappers into values psycopg can adapt."""
+
+    if isinstance(value, pa.Scalar):
+        value = value.as_py()
+    if isinstance(value, np.generic):
+        value = value.item()
+    if value is pd.NA or value is pd.NaT:
+        return None
+    if isinstance(value, pd.Timestamp):
+        return value.to_pydatetime()
+    return value
 
 
 def _physical_schema_name(namespace: str) -> str:
@@ -218,7 +233,7 @@ class PgVectorTable(VectorTable):
         for col, val in values.items():
             _validate_identifier(col)
             set_parts.append(f"{col} = %s")
-            params.append(val)
+            params.append(_to_postgres_value(val))
         set_clause = ", ".join(set_parts)
         combined, ds_params = self._namespace_where_fragment(compiled)
         where_clause = f" WHERE {combined}" if combined else ""
@@ -804,7 +819,7 @@ class PgVectorTable(VectorTable):
         for _, row in df.iterrows():
             values = []
             for col in columns:
-                val = row[col]
+                val = _to_postgres_value(row[col])
                 if col == self._vector_column and val is not None:
                     val = str(list(val)) if not isinstance(val, str) else val
                 values.append(val)
@@ -858,7 +873,7 @@ class PgVectorTable(VectorTable):
         for _, row in df.iterrows():
             values = []
             for col in columns:
-                val = row[col]
+                val = _to_postgres_value(row[col])
                 if col == self._vector_column and val is not None:
                     val = str(list(val)) if not isinstance(val, str) else val
                 values.append(val)

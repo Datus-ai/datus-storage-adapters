@@ -1,5 +1,7 @@
 """Tests for PgvectorBackend (three-layer architecture)."""
 
+from datetime import datetime, timezone
+
 import pandas as pd
 import pyarrow as pa
 import pytest
@@ -256,6 +258,46 @@ class TestVectorTableWrite:
         assert table.count_rows() == 3
         result = table.search_all(where=eq("id", "u1"))
         assert result.column("category")[0].as_py() == "updated"
+
+    def test_write_operations_convert_dataframe_scalar_wrappers(self, db):
+        db.drop_table("scalar_values", ignore_missing=True)
+        scalar_table = db.create_table(
+            "scalar_values",
+            schema=pa.schema(
+                [
+                    pa.field("id", pa.string()),
+                    pa.field("updated_at", pa.timestamp("us", tz="UTC")),
+                    pa.field("row_count", pa.int64()),
+                ]
+            ),
+            unique_columns=["id"],
+        )
+        first_timestamp = datetime(2026, 7, 13, 8, 0, tzinfo=timezone.utc)
+        second_timestamp = datetime(2026, 7, 13, 9, 0, tzinfo=timezone.utc)
+
+        scalar_table.add(
+            pd.DataFrame(
+                {
+                    "id": ["scalar-1"],
+                    "updated_at": [pa.scalar(first_timestamp, type=pa.timestamp("us", tz="UTC"))],
+                    "row_count": [pa.scalar(1, type=pa.int64())],
+                }
+            )
+        )
+        scalar_table.merge_insert(
+            pd.DataFrame(
+                {
+                    "id": ["scalar-1"],
+                    "updated_at": [pa.scalar(second_timestamp, type=pa.timestamp("us", tz="UTC"))],
+                    "row_count": [pa.scalar(2, type=pa.int64())],
+                }
+            ),
+            "id",
+        )
+
+        result = scalar_table.search_all()
+        assert result.column("updated_at")[0].as_py() == second_timestamp.replace(tzinfo=None)
+        assert result.column("row_count")[0].as_py() == 2
 
     def test_delete_str(self, table):
         table.add(_sample_df(["d1", "d2", "d3"], categories=["rm", "keep", "rm"]))

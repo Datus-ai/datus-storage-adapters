@@ -20,6 +20,7 @@ import pandas as pd
 import pyarrow as pa
 
 from datus_storage_base.conditions import WhereExpr
+from datus_storage_base.vector.fts import FtsIndexStatus, FtsSpec, FtsSpecInput
 
 # ---------------------------------------------------------------------------
 # Embedding function ABC (backend-independent)
@@ -95,6 +96,18 @@ class VectorTable(ABC):
     ) -> pa.Table:
         """Perform a hybrid (vector + FTS) search with reranking."""
 
+    def search_fts(
+        self,
+        query_text: str,
+        fts_spec: FtsSpec,
+        top_n: int,
+        where: WhereExpr = None,
+        select_fields: Optional[List[str]] = None,
+    ) -> pa.Table:
+        """Perform a full-text-only search without vector fallback."""
+
+        raise NotImplementedError(f"{type(self).__name__} does not support FTS search")
+
     @abstractmethod
     def search_all(
         self,
@@ -115,12 +128,22 @@ class VectorTable(ABC):
         """Create a vector index."""
 
     @abstractmethod
-    def create_fts_index(self, field_names: Union[str, List[str]]) -> None:
+    def create_fts_index(self, spec: FtsSpecInput) -> None:
         """Create a full-text search index."""
 
     @abstractmethod
     def create_scalar_index(self, column: str) -> None:
         """Create a scalar index."""
+
+    def supports_fts(self) -> bool:
+        """Return whether this table implements the FTS capability contract."""
+
+        return False
+
+    def fts_index_status(self, spec: FtsSpec) -> FtsIndexStatus:
+        """Return readiness of the index associated with *spec*."""
+
+        return FtsIndexStatus.UNSUPPORTED
 
     # -- Schema evolution --
 
@@ -140,6 +163,9 @@ class VectorTable(ABC):
 
     def cleanup_old_versions(self) -> None:
         """Clean up old table versions. Not all backends support this."""
+
+    def optimize(self) -> None:
+        """Synchronize indexes after incremental writes when required."""
 
 
 # ---------------------------------------------------------------------------
@@ -219,6 +245,11 @@ class VectorDatabase(ABC):
 
     def close(self) -> None:
         """Release resources held by this database connection."""
+
+    def supports_fts(self) -> bool:
+        """Return whether tables opened by this database support FTS."""
+
+        return False
 
 
 # ---------------------------------------------------------------------------

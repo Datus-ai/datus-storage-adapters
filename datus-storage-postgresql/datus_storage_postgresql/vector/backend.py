@@ -8,10 +8,13 @@ Three-layer architecture:
                                     +-- open_table(name) -> PgVectorTable(VectorTable)
 """
 
+import hashlib
+import json
 import logging
 import re
 import threading
-from typing import Any, Dict, List, Optional, Union
+from dataclasses import asdict
+from typing import Any, Dict, List, Optional
 
 import pandas as pd
 import pyarrow as pa
@@ -22,11 +25,18 @@ from psycopg_pool import ConnectionPool
 from datus_storage_base.backend_config import LOGICAL_NAMESPACE_COLUMN, IsolationType
 from datus_storage_base.conditions import WhereExpr, build_where
 from datus_storage_base.vector.base import BaseVectorBackend, EmbeddingFunction, VectorDatabase, VectorTable
+from datus_storage_base.vector.fts import FtsField, FtsIndexStatus, FtsSpec, FtsSpecInput, normalize_fts_spec
 from datus_storage_postgresql.vector.schema_converter import schema_to_create_table_sql
 
 logger = logging.getLogger(__name__)
 
 _SAFE_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_SAFE_SCHEMA_IDENTIFIER = re.compile(r"^[a-z_][a-z0-9_]*$")
+_FTS_METADATA_TABLE = "_datus_fts_specs"
+_FTS_NGRAM_FUNCTION = "_datus_fts_ngrams"
+_FTS_GENERATED_COLUMN_PREFIX = "_datus_fts_vector_"
+_FTS_BACKEND_VERSION = 1
+_FTS_SCORE_COLUMNS = {"_score", "_relevance_score", "_distance"}
 
 
 def _validate_identifier(name: str) -> str:
@@ -34,6 +44,85 @@ def _validate_identifier(name: str) -> str:
     if not _SAFE_IDENTIFIER.match(name):
         raise ValueError(f"Invalid SQL identifier: {name!r}")
     return name
+
+
+def _physical_schema_name(namespace: str) -> str:
+    """Map an opaque Datus namespace to a stable PostgreSQL schema name."""
+
+    if not namespace:
+        return "public"
+    if _SAFE_SCHEMA_IDENTIFIER.fullmatch(namespace) and len(namespace) <= 63:
+        return namespace
+    normalized = re.sub(r"[^a-z0-9_]", "_", namespace.lower()).strip("_") or "namespace"
+    if normalized[0].isdigit():
+        normalized = f"n_{normalized}"
+    digest = hashlib.sha256(namespace.encode("utf-8")).hexdigest()[:10]
+    return f"{normalized[:52]}_{digest}"
+
+
+def _ensure_postgres_extension(conn: Any, extension: str) -> None:
+    installed = conn.execute("SELECT 1 FROM pg_extension WHERE extname = %s", (extension,)).fetchone()
+    if installed:
+        return
+    available = conn.execute("SELECT 1 FROM pg_available_extensions WHERE name = %s", (extension,)).fetchone()
+    if not available:
+        raise RuntimeError(f"PostgreSQL extension '{extension}' is not available on this server")
+    try:
+        conn.execute(psql.SQL("CREATE EXTENSION IF NOT EXISTS {}").format(psql.Identifier(extension)))
+    except Exception as exc:
+        raise RuntimeError(
+            f"PostgreSQL extension '{extension}' is required; ask a database superuser to run "
+            f"CREATE EXTENSION {extension};"
+        ) from exc
+
+
+def _fts_spec_payload(spec: FtsSpec) -> Dict[str, Any]:
+    return {
+        "backend_version": _FTS_BACKEND_VERSION,
+        "version": spec.version,
+        "fields": [asdict(field) for field in spec.fields],
+    }
+
+
+def _fts_spec_json(spec: FtsSpec) -> str:
+    return json.dumps(_fts_spec_payload(spec), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _fts_spec_hash(spec: FtsSpec) -> str:
+    return hashlib.sha256(_fts_spec_json(spec).encode("utf-8")).hexdigest()
+
+
+def _ngram_terms(text: str, min_length: int, max_length: int) -> List[str]:
+    """Build deterministic Unicode ngrams while keeping the SQL query bounded."""
+
+    tokens = re.findall(r"[^\W_]+", text.lower(), flags=re.UNICODE)
+    terms: List[str] = []
+    seen: set[str] = set()
+    for token in tokens:
+        if len(token) < min_length:
+            candidates = [token] if token else []
+        else:
+            candidates = [
+                token[start : start + size]
+                for size in range(min_length, min(max_length, len(token)) + 1)
+                for start in range(0, len(token) - size + 1)
+            ]
+        for candidate in candidates:
+            if candidate not in seen:
+                seen.add(candidate)
+                terms.append(candidate)
+                if len(terms) >= 64:
+                    return terms
+    return terms
+
+
+def _schema_uses_vector(schema: Optional[pa.Schema]) -> bool:
+    if schema is None:
+        return False
+    return any(
+        isinstance(field.type, (pa.FixedSizeListType, pa.ListType)) and pa.types.is_floating(field.type.value_type)
+        for field in schema
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -219,6 +308,67 @@ class PgVectorTable(VectorTable):
             select_fields=select_fields,
         )
 
+    def search_fts(
+        self,
+        query_text: str,
+        fts_spec: FtsSpec,
+        top_n: int,
+        where: WhereExpr = None,
+        select_fields: Optional[List[str]] = None,
+    ) -> pa.Table:
+        """Search PostgreSQL native FTS indexes without vector fallback."""
+
+        spec = normalize_fts_spec(fts_spec)
+        status = self.fts_index_status(spec)
+        if status != FtsIndexStatus.READY:
+            raise RuntimeError(f"FTS index for '{self._table_name}' is {status.value}")
+        if top_n <= 0:
+            return self._empty_fts_result(select_fields)
+
+        if isinstance(where, str):
+            compiled = where
+        else:
+            compiled = build_where(where)
+        combined, namespace_params = self._namespace_where_fragment(compiled)
+
+        score_parts: List[Any] = []
+        score_params: List[Any] = []
+        match_parts: List[Any] = []
+        match_params: List[Any] = []
+        for field in spec.fields:
+            field_score, field_score_params, field_match, field_match_params = self._fts_field_query(field, query_text)
+            if field_match is None:
+                continue
+            score_parts.append(field_score)
+            score_params.extend(field_score_params)
+            match_parts.append(field_match)
+            match_params.extend(field_match_params)
+
+        if not match_parts:
+            return self._empty_fts_result(select_fields)
+
+        result_fields = [field for field in (select_fields or self._default_columns) if field not in _FTS_SCORE_COLUMNS]
+        score_sql = psql.SQL(" + ").join(score_parts)
+        select_items = [psql.Identifier(field) for field in result_fields]
+        select_items.append(psql.SQL("({}) AS _score").format(score_sql))
+        match_sql = psql.SQL(" OR ").join(match_parts)
+        where_parts = [psql.SQL("({})").format(match_sql)]
+        if combined:
+            where_parts.insert(0, psql.SQL("({})").format(psql.SQL(combined)))
+        where_sql = psql.SQL(" AND ").join(where_parts)
+        query = psql.SQL("SELECT {columns} FROM {table} WHERE {where_clause} ORDER BY _score DESC LIMIT %s").format(
+            columns=psql.SQL(", ").join(select_items),
+            table=self._qualified_table_identifier(),
+            where_clause=where_sql,
+        )
+        params = score_params + namespace_params + match_params + [top_n]
+        with self._pool.connection() as conn:
+            rows = conn.execute(query, params).fetchall()
+
+        if not rows:
+            return self._empty_fts_result(select_fields)
+        return self._rows_to_arrow(rows)
+
     def search_all(
         self,
         where: WhereExpr = None,
@@ -272,25 +422,68 @@ class PgVectorTable(VectorTable):
             conn.execute(sql)
             conn.commit()
 
-    def create_fts_index(self, field_names: Union[str, List[str]]) -> None:
-        if isinstance(field_names, str):
-            field_names = [field_names]
-        for f in field_names:
-            _validate_identifier(f)
+    def create_fts_index(self, spec: FtsSpecInput) -> None:
+        """Create backend-native indexes for the complete FTS specification."""
 
-        tsv_col = "tsv"
-        coalesce_parts = " || ' ' || ".join(f"COALESCE({f}, '')" for f in field_names)
-        table_token = self._table_name.rsplit(".", 1)[-1]
-        index_name = f"idx_{table_token}_fts"
+        normalized = normalize_fts_spec(spec)
+        existing_columns = set(self._fetch_column_names())
+        for field in normalized.fields:
+            _validate_identifier(field.name)
+            if field.name not in existing_columns:
+                raise ValueError(f"FTS field '{field.name}' does not exist on table '{self._table_name}'")
 
         with self._pool.connection() as conn:
-            conn.execute(
-                f"ALTER TABLE {self._table_name} "
-                f"ADD COLUMN IF NOT EXISTS {tsv_col} tsvector "
-                f"GENERATED ALWAYS AS (to_tsvector('english', {coalesce_parts})) STORED"
-            )
-            conn.execute(f"CREATE INDEX IF NOT EXISTS {index_name} ON {self._table_name} USING gin ({tsv_col})")
+            self._ensure_fts_metadata_table(conn)
+            if self._fts_index_status(conn, normalized) == FtsIndexStatus.READY:
+                return
+
+            previous = self._read_fts_spec(conn)
+            fields_to_drop = {field.name for field in normalized.fields}
+            if previous is not None:
+                fields_to_drop.update(field.name for field in previous.fields)
+            for field_name in fields_to_drop:
+                self._drop_fts_index(conn, field_name)
+
+            if any(field.tokenizer == "raw" for field in normalized.fields):
+                self._ensure_extension(conn, "pg_trgm")
+            if any(field.tokenizer == "ngram" for field in normalized.fields):
+                self._ensure_fts_ngram_function(conn)
+            for field in normalized.fields:
+                self._create_fts_field_index(conn, field)
+            self._write_fts_spec(conn, normalized)
             conn.commit()
+
+    def supports_fts(self) -> bool:
+        return True
+
+    def fts_index_status(self, spec: FtsSpec) -> FtsIndexStatus:
+        normalized = normalize_fts_spec(spec)
+        with self._pool.connection() as conn:
+            return self._fts_index_status(conn, normalized)
+
+    def remove_legacy_fts_index(self) -> bool:
+        """Remove the fixed ``tsv`` index created by adapter versions before the FTS contract."""
+
+        with self._pool.connection() as conn:
+            if not self._has_legacy_fts_index(conn):
+                return False
+            schema, table = self._table_parts()
+            legacy_index = f"idx_{table}_fts"
+            conn.execute(psql.SQL("DROP INDEX IF EXISTS {}").format(self._qualified_index_identifier(legacy_index)))
+            generated = conn.execute(
+                "SELECT 1 FROM information_schema.columns WHERE table_schema = %s AND table_name = %s "
+                "AND column_name = 'tsv' AND is_generated = 'ALWAYS'",
+                (schema, table),
+            ).fetchone()
+            if generated:
+                conn.execute(
+                    psql.SQL("ALTER TABLE {} DROP COLUMN {}").format(
+                        self._qualified_table_identifier(),
+                        psql.Identifier("tsv"),
+                    )
+                )
+            conn.commit()
+            return True
 
     def create_scalar_index(self, column: str) -> None:
         _validate_identifier(column)
@@ -301,7 +494,248 @@ class PgVectorTable(VectorTable):
             conn.execute(sql)
             conn.commit()
 
+    def optimize(self) -> None:
+        """PostgreSQL maintains GIN indexes transactionally during DML."""
+
     # -- Private helpers --
+
+    def _table_parts(self) -> tuple[str, str]:
+        if "." in self._table_name:
+            return tuple(self._table_name.split(".", 1))
+        return "public", self._table_name
+
+    def _qualified_table_identifier(self) -> Any:
+        schema, table = self._table_parts()
+        return psql.Identifier(schema, table) if schema != "public" else psql.Identifier(table)
+
+    def _qualified_metadata_identifier(self) -> Any:
+        schema, _ = self._table_parts()
+        return (
+            psql.Identifier(schema, _FTS_METADATA_TABLE) if schema != "public" else psql.Identifier(_FTS_METADATA_TABLE)
+        )
+
+    def _qualified_index_identifier(self, index_name: str) -> Any:
+        schema, _ = self._table_parts()
+        return psql.Identifier(schema, index_name) if schema != "public" else psql.Identifier(index_name)
+
+    def _qualified_ngram_function_identifier(self) -> Any:
+        schema, _ = self._table_parts()
+        return (
+            psql.Identifier(schema, _FTS_NGRAM_FUNCTION) if schema != "public" else psql.Identifier(_FTS_NGRAM_FUNCTION)
+        )
+
+    def _fts_index_name(self, field_name: str) -> str:
+        _, table = self._table_parts()
+        digest = hashlib.sha256(f"{table}:{field_name}".encode("utf-8")).hexdigest()[:10]
+        readable = re.sub(r"[^A-Za-z0-9_]", "_", f"idx_{table}_{field_name}_datus_fts")
+        return f"{readable[:52]}_{digest}"
+
+    def _fts_vector_column_name(self, field_name: str) -> str:
+        _, table = self._table_parts()
+        digest = hashlib.sha256(f"{table}:{field_name}".encode("utf-8")).hexdigest()[:16]
+        return f"{_FTS_GENERATED_COLUMN_PREFIX}{digest}"
+
+    def _ensure_extension(self, conn: Any, extension: str) -> None:
+        _ensure_postgres_extension(conn, extension)
+
+    def _ensure_fts_metadata_table(self, conn: Any) -> None:
+        conn.execute(
+            psql.SQL(
+                "CREATE TABLE IF NOT EXISTS {} ("
+                "table_name TEXT PRIMARY KEY, spec_hash TEXT NOT NULL, spec_json JSONB NOT NULL, "
+                "version INTEGER NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP)"
+            ).format(self._qualified_metadata_identifier())
+        )
+
+    def _ensure_fts_ngram_function(self, conn: Any) -> None:
+        conn.execute(
+            psql.SQL(
+                "CREATE OR REPLACE FUNCTION {}(input_text TEXT, min_len INTEGER, max_len INTEGER) "
+                "RETURNS TEXT LANGUAGE SQL IMMUTABLE PARALLEL SAFE AS $datus_fts$ "
+                "WITH tokens AS ("
+                "SELECT token FROM regexp_split_to_table(LOWER(COALESCE(input_text, '')), "
+                "'[[:space:][:punct:]]+') AS token WHERE token <> ''"
+                "), grams AS ("
+                "SELECT token AS gram FROM tokens WHERE char_length(token) < min_len "
+                "UNION ALL "
+                "SELECT substr(token, gram_position, gram_size) FROM tokens "
+                "CROSS JOIN LATERAL generate_series(min_len, LEAST(max_len, char_length(token))) AS gram_size "
+                "CROSS JOIN LATERAL generate_series(1, char_length(token) - gram_size + 1) AS gram_position "
+                "WHERE char_length(token) >= min_len"
+                ") SELECT COALESCE(string_agg(gram, ' ' ORDER BY gram), '') FROM grams $datus_fts$"
+            ).format(self._qualified_ngram_function_identifier())
+        )
+
+    def _fts_metadata_table_exists(self, conn: Any) -> bool:
+        schema, _ = self._table_parts()
+        qualified = f"{schema}.{_FTS_METADATA_TABLE}"
+        row = conn.execute("SELECT to_regclass(%s) IS NOT NULL AS exists", (qualified,)).fetchone()
+        return bool(row["exists"] if isinstance(row, dict) else row[0])
+
+    def _read_fts_spec(self, conn: Any) -> Optional[FtsSpec]:
+        if not self._fts_metadata_table_exists(conn):
+            return None
+        _, table = self._table_parts()
+        row = conn.execute(
+            psql.SQL("SELECT spec_json FROM {} WHERE table_name = %s").format(self._qualified_metadata_identifier()),
+            (table,),
+        ).fetchone()
+        if not row:
+            return None
+        payload = row["spec_json"] if isinstance(row, dict) else row[0]
+        if isinstance(payload, str):
+            payload = json.loads(payload)
+        return FtsSpec(
+            tuple(FtsField(**field) for field in payload["fields"]),
+            version=int(payload["version"]),
+        )
+
+    def _write_fts_spec(self, conn: Any, spec: FtsSpec) -> None:
+        _, table = self._table_parts()
+        conn.execute(
+            psql.SQL(
+                "INSERT INTO {} (table_name, spec_hash, spec_json, version) VALUES (%s, %s, %s::jsonb, %s) "
+                "ON CONFLICT (table_name) DO UPDATE SET spec_hash = EXCLUDED.spec_hash, "
+                "spec_json = EXCLUDED.spec_json, version = EXCLUDED.version, updated_at = CURRENT_TIMESTAMP"
+            ).format(self._qualified_metadata_identifier()),
+            (table, _fts_spec_hash(spec), _fts_spec_json(spec), spec.version),
+        )
+
+    def _create_fts_field_index(self, conn: Any, field: FtsField) -> None:
+        index_name = self._fts_index_name(field.name)
+        if field.tokenizer == "raw":
+            statement = psql.SQL("CREATE INDEX {} ON {} USING gin ({} gin_trgm_ops)").format(
+                psql.Identifier(index_name),
+                self._qualified_table_identifier(),
+                psql.Identifier(field.name),
+            )
+        elif field.tokenizer == "ngram":
+            generated_column = self._fts_vector_column_name(field.name)
+            conn.execute(
+                psql.SQL(
+                    "ALTER TABLE {} ADD COLUMN {} TSVECTOR GENERATED ALWAYS AS ("
+                    "to_tsvector('simple', {}(COALESCE({}, ''), {}, {}))) STORED"
+                ).format(
+                    self._qualified_table_identifier(),
+                    psql.Identifier(generated_column),
+                    self._qualified_ngram_function_identifier(),
+                    psql.Identifier(field.name),
+                    psql.Literal(field.ngram_min_length),
+                    psql.Literal(field.ngram_max_length),
+                )
+            )
+            statement = psql.SQL("CREATE INDEX {} ON {} USING gin ({})").format(
+                psql.Identifier(index_name),
+                self._qualified_table_identifier(),
+                psql.Identifier(generated_column),
+            )
+        else:
+            statement = psql.SQL("CREATE INDEX {} ON {} USING gin (to_tsvector('simple', COALESCE({}, '')))").format(
+                psql.Identifier(index_name),
+                self._qualified_table_identifier(),
+                psql.Identifier(field.name),
+            )
+        conn.execute(statement)
+
+    def _drop_fts_index(self, conn: Any, field_name: str) -> None:
+        conn.execute(
+            psql.SQL("DROP INDEX IF EXISTS {}").format(
+                self._qualified_index_identifier(self._fts_index_name(field_name))
+            )
+        )
+        conn.execute(
+            psql.SQL("ALTER TABLE {} DROP COLUMN IF EXISTS {}").format(
+                self._qualified_table_identifier(),
+                psql.Identifier(self._fts_vector_column_name(field_name)),
+            )
+        )
+
+    def _fts_index_exists(self, conn: Any, field_name: str) -> bool:
+        schema, _ = self._table_parts()
+        row = conn.execute(
+            "SELECT 1 FROM pg_indexes WHERE schemaname = %s AND indexname = %s",
+            (schema, self._fts_index_name(field_name)),
+        ).fetchone()
+        return bool(row)
+
+    def _fts_vector_column_exists(self, conn: Any, field_name: str) -> bool:
+        schema, table = self._table_parts()
+        row = conn.execute(
+            "SELECT 1 FROM information_schema.columns WHERE table_schema = %s AND table_name = %s AND column_name = %s",
+            (schema, table, self._fts_vector_column_name(field_name)),
+        ).fetchone()
+        return bool(row)
+
+    def _has_legacy_fts_index(self, conn: Any) -> bool:
+        schema, table = self._table_parts()
+        legacy_index = f"idx_{table}_fts"
+        index_row = conn.execute(
+            "SELECT 1 FROM pg_indexes WHERE schemaname = %s AND indexname = %s",
+            (schema, legacy_index),
+        ).fetchone()
+        column_row = conn.execute(
+            "SELECT 1 FROM information_schema.columns "
+            "WHERE table_schema = %s AND table_name = %s AND column_name = 'tsv'",
+            (schema, table),
+        ).fetchone()
+        return bool(index_row or column_row)
+
+    def _fts_index_status(self, conn: Any, spec: FtsSpec) -> FtsIndexStatus:
+        if not self._fts_metadata_table_exists(conn):
+            return FtsIndexStatus.LEGACY if self._has_legacy_fts_index(conn) else FtsIndexStatus.MISSING
+        _, table = self._table_parts()
+        row = conn.execute(
+            psql.SQL("SELECT spec_hash FROM {} WHERE table_name = %s").format(self._qualified_metadata_identifier()),
+            (table,),
+        ).fetchone()
+        if not row:
+            return FtsIndexStatus.LEGACY if self._has_legacy_fts_index(conn) else FtsIndexStatus.MISSING
+        stored_hash = row["spec_hash"] if isinstance(row, dict) else row[0]
+        if stored_hash != _fts_spec_hash(spec):
+            return FtsIndexStatus.VERSION_MISMATCH
+        if not all(self._fts_index_exists(conn, field.name) for field in spec.fields):
+            return FtsIndexStatus.MISSING
+        if any(
+            field.tokenizer == "ngram" and not self._fts_vector_column_exists(conn, field.name) for field in spec.fields
+        ):
+            return FtsIndexStatus.MISSING
+        return FtsIndexStatus.READY
+
+    def _fts_field_query(self, field: FtsField, query_text: str) -> tuple[Any, List[Any], Optional[Any], List[Any]]:
+        column = psql.Identifier(field.name)
+        if field.tokenizer in {"simple", "whitespace"}:
+            vector = psql.SQL("to_tsvector('simple', COALESCE({}, ''))").format(column)
+            query = psql.SQL("plainto_tsquery('simple', %s)")
+            score = psql.SQL("ts_rank_cd({}, {}) * %s").format(vector, query)
+            match = psql.SQL("{} @@ {}").format(vector, query)
+            return score, [query_text, field.boost], match, [query_text]
+
+        if field.tokenizer == "raw":
+            pattern = f"%{query_text}%"
+            score = psql.SQL("CASE WHEN COALESCE({}, '') ILIKE %s THEN %s ELSE 0 END").format(column)
+            match = psql.SQL("COALESCE({}, '') ILIKE %s").format(column)
+            return score, [pattern, field.boost], match, [pattern]
+
+        terms = _ngram_terms(query_text, field.ngram_min_length, field.ngram_max_length)
+        if not terms:
+            return psql.SQL("0"), [], None, []
+        vector = psql.Identifier(self._fts_vector_column_name(field.name))
+        query = psql.SQL("to_tsquery('simple', %s)")
+        query_value = " | ".join(terms)
+        score = psql.SQL("ts_rank({}, {}) * %s").format(vector, query)
+        match = psql.SQL("{} @@ {}").format(vector, query)
+        return score, [query_value, field.boost], match, [query_value]
+
+    def _empty_fts_result(self, select_fields: Optional[List[str]]) -> pa.Table:
+        fields = [field for field in (select_fields or self._default_columns) if field not in _FTS_SCORE_COLUMNS]
+        arrays: Dict[str, pa.Array] = {}
+        for field in fields:
+            if field == self._vector_column:
+                arrays[field] = pa.array([], type=pa.list_(pa.float32(), list_size=self._vector_dim))
+            else:
+                arrays[field] = pa.array([], type=pa.string())
+        arrays["_score"] = pa.array([], type=pa.float64())
+        return pa.table(arrays)
 
     def _namespace_where_fragment(self, existing_compiled: Optional[str] = None) -> tuple:
         """Build WHERE clause fragment with backend namespace for logical isolation.
@@ -472,7 +906,7 @@ class PgVectorTable(VectorTable):
     @property
     def _default_columns(self) -> List[str]:
         """Return column names filtered for the current isolation mode."""
-        cols = self._column_names
+        cols = [column for column in self._column_names if not column.startswith(_FTS_GENERATED_COLUMN_PREFIX)]
         if self._isolation == IsolationType.LOGICAL:
             cols = [c for c in cols if c != LOGICAL_NAMESPACE_COLUMN]
         return cols
@@ -566,7 +1000,7 @@ class PgVectorDb(VectorDatabase):
             self._schema = "public"
             self._logical_namespace = namespace
         else:
-            self._schema = _validate_identifier(namespace) if namespace else "public"
+            self._schema = _physical_schema_name(namespace)
             self._logical_namespace = None
 
         # Ensure schema exists for non-public namespaces
@@ -582,6 +1016,9 @@ class PgVectorDb(VectorDatabase):
     @property
     def namespace(self) -> str:
         return self._namespace
+
+    def supports_fts(self) -> bool:
+        return True
 
     def _qualified(self, table_name: str) -> str:
         """Return schema-qualified table name."""
@@ -603,8 +1040,9 @@ class PgVectorDb(VectorDatabase):
     def table_names(self, limit: int = 100) -> List[str]:
         with self._pool.connection() as conn:
             rows = conn.execute(
-                "SELECT table_name FROM information_schema.tables WHERE table_schema = %s ORDER BY table_name LIMIT %s",
-                (self._schema, limit),
+                "SELECT table_name FROM information_schema.tables "
+                "WHERE table_schema = %s AND table_name <> %s ORDER BY table_name LIMIT %s",
+                (self._schema, _FTS_METADATA_TABLE, limit),
             ).fetchall()
             return [r["table_name"] if isinstance(r, dict) else r[0] for r in rows]
 
@@ -828,6 +1266,8 @@ class PgVectorDb(VectorDatabase):
                 raise TypeError(f"Unsupported schema type: {type(schema)}")
 
             with self._pool.connection() as conn:
+                if _schema_uses_vector(schema):
+                    _ensure_postgres_extension(conn, "vector")
                 conn.execute(ddl)
                 # Create indexes for logical isolation
                 if self._isolation == IsolationType.LOGICAL:
@@ -944,6 +1384,20 @@ class PgVectorDb(VectorDatabase):
         sql = f"DROP TABLE {if_exists}{qualified}"
         with self._pool.connection() as conn:
             conn.execute(sql)
+            metadata_name = f"{self._schema}.{_FTS_METADATA_TABLE}"
+            metadata_exists = conn.execute("SELECT to_regclass(%s) IS NOT NULL AS exists", (metadata_name,)).fetchone()
+            if metadata_exists and (
+                metadata_exists["exists"] if isinstance(metadata_exists, dict) else metadata_exists[0]
+            ):
+                metadata_table = (
+                    psql.Identifier(self._schema, _FTS_METADATA_TABLE)
+                    if self._schema != "public"
+                    else psql.Identifier(_FTS_METADATA_TABLE)
+                )
+                conn.execute(
+                    psql.SQL("DELETE FROM {} WHERE table_name = %s").format(metadata_table),
+                    (table_name,),
+                )
             conn.commit()
         self._invalidate_cache(table_name)
 
@@ -1001,21 +1455,6 @@ class PgvectorBackend(BaseVectorBackend):
                 max_size=max_size,
                 kwargs={"row_factory": dict_row},
             )
-
-            # Ensure pgvector extension is available
-            with pool.connection() as conn:
-                row = conn.execute("SELECT 1 FROM pg_extension WHERE extname = 'vector'").fetchone()
-                if not row:
-                    try:
-                        conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
-                        conn.commit()
-                    except Exception as e:
-                        pool.close()
-                        raise RuntimeError(
-                            "pgvector extension is not installed and current user "
-                            "lacks permission to create it. Please ask a database "
-                            "superuser to run: CREATE EXTENSION vector;"
-                        ) from e
 
             self._pool = pool
         return self._pool

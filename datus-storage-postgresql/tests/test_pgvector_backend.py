@@ -8,7 +8,14 @@ from psycopg_pool import PoolClosed
 
 from datus_storage_base.backend_config import LOGICAL_NAMESPACE_COLUMN
 from datus_storage_base.conditions import and_, eq, not_, or_
-from datus_storage_postgresql.vector.backend import PgvectorBackend, PgVectorDb, PgVectorTable
+from datus_storage_base.vector.fts import FtsField, FtsIndexStatus, FtsSpec
+from datus_storage_postgresql.vector.backend import (
+    PgvectorBackend,
+    PgVectorDb,
+    PgVectorTable,
+    _ngram_terms,
+    _physical_schema_name,
+)
 
 
 @pytest.fixture
@@ -62,6 +69,22 @@ def table(db, test_schema, embedding_function):
     return tbl
 
 
+@pytest.fixture
+def fts_table(db):
+    """Create a text-only table for native PostgreSQL FTS tests."""
+
+    db.drop_table("test_fts", ignore_missing=True)
+    schema = pa.schema(
+        [
+            pa.field("id", pa.string()),
+            pa.field("title", pa.string()),
+            pa.field("search_text", pa.string()),
+            pa.field("category", pa.string()),
+        ]
+    )
+    return db.create_table("test_fts", schema=schema, unique_columns=["id"])
+
+
 def _sample_df(ids, descriptions=None, categories=None):
     """Helper to build a DataFrame for tests."""
     n = len(ids)
@@ -90,6 +113,11 @@ class TestBackendLifecycle:
         b.initialize({})
         with pytest.raises(ValueError, match="Missing required"):
             b.connect("test")
+
+    def test_connect_does_not_eagerly_install_vector_extension(self, db):
+        with db.pool.connection() as conn:
+            row = conn.execute("SELECT 1 FROM pg_extension WHERE extname = 'vector'").fetchone()
+        assert row is None
 
     def test_connect_returns_pg_vector_db(self, db):
         assert isinstance(db, PgVectorDb)
@@ -414,15 +442,226 @@ class TestIndexOperations:
         table.create_fts_index(["description", "category"])
 
 
+class TestNativeFts:
+    NGRAM_SPEC = FtsSpec((FtsField("search_text", tokenizer="ngram"),), version=1)
+
+    def test_ngram_terms_split_identifier_punctuation(self):
+        assert _ngram_terms("Sales_Order-Fact", 2, 2) == [
+            "sa",
+            "al",
+            "le",
+            "es",
+            "or",
+            "rd",
+            "de",
+            "er",
+            "fa",
+            "ac",
+            "ct",
+        ]
+
+    def test_database_and_table_report_fts_support(self, db, fts_table):
+        assert db.supports_fts() is True
+        assert fts_table.supports_fts() is True
+
+    def test_internal_fts_metadata_table_is_hidden(self, db, fts_table):
+        fts_table.create_fts_index(self.NGRAM_SPEC)
+        assert "_datus_fts_specs" not in db.table_names()
+
+    def test_create_and_query_chinese_ngram_index(self, db, fts_table):
+        fts_table.add(
+            pd.DataFrame(
+                {
+                    "id": ["orders", "customers"],
+                    "title": ["Sales orders", "Customers"],
+                    "search_text": ["table sales_order definition 销售订单明细", "table customer definition 客户资料"],
+                    "category": ["fact", "dimension"],
+                }
+            )
+        )
+
+        assert fts_table.fts_index_status(self.NGRAM_SPEC) == FtsIndexStatus.MISSING
+        fts_table.create_fts_index(self.NGRAM_SPEC)
+        assert fts_table.fts_index_status(self.NGRAM_SPEC) == FtsIndexStatus.READY
+
+        result = fts_table.search_fts("销售订单", self.NGRAM_SPEC, top_n=5)
+
+        assert result.column("id").to_pylist() == ["orders"]
+        assert result.column("_score")[0].as_py() > 0
+        generated_column = fts_table._fts_vector_column_name("search_text")
+        with fts_table._pool.connection() as conn:
+            index_definition = conn.execute(
+                "SELECT indexdef FROM pg_indexes WHERE schemaname = 'public' AND indexname = %s",
+                (fts_table._fts_index_name("search_text"),),
+            ).fetchone()["indexdef"]
+            generation_expression = conn.execute(
+                "SELECT generation_expression FROM information_schema.columns "
+                "WHERE table_schema = 'public' AND table_name = 'test_fts' AND column_name = %s",
+                (generated_column,),
+            ).fetchone()["generation_expression"]
+            pg_trgm = conn.execute("SELECT 1 FROM pg_extension WHERE extname = 'pg_trgm'").fetchone()
+        assert generated_column in index_definition
+        assert "_datus_fts_ngrams" in generation_expression
+        assert "to_tsvector" in generation_expression
+        assert pg_trgm is None
+
+        reopened = db.refresh_table("test_fts")
+        assert all(not column.startswith("_datus_fts_vector_") for column in reopened.search_all().column_names)
+
+    def test_raw_substring_search_installs_pg_trgm_lazily(self, fts_table):
+        spec = FtsSpec((FtsField("search_text", tokenizer="raw"),))
+        fts_table.add(
+            pd.DataFrame(
+                {
+                    "id": ["orders"],
+                    "title": ["Orders"],
+                    "search_text": ["sales_order_fact"],
+                    "category": ["fact"],
+                }
+            )
+        )
+        fts_table.create_fts_index(spec)
+
+        result = fts_table.search_fts("order", spec, top_n=5)
+
+        assert result.column("id").to_pylist() == ["orders"]
+        with fts_table._pool.connection() as conn:
+            index_definition = conn.execute(
+                "SELECT indexdef FROM pg_indexes WHERE schemaname = 'public' AND indexname = %s",
+                (fts_table._fts_index_name("search_text"),),
+            ).fetchone()["indexdef"]
+            pg_trgm = conn.execute("SELECT 1 FROM pg_extension WHERE extname = 'pg_trgm'").fetchone()
+        assert "gin_trgm_ops" in index_definition
+        assert pg_trgm is not None
+
+    def test_zero_match_does_not_fall_back(self, fts_table):
+        fts_table.add(
+            pd.DataFrame(
+                {
+                    "id": ["orders"],
+                    "title": ["Sales orders"],
+                    "search_text": ["销售订单明细"],
+                    "category": ["fact"],
+                }
+            )
+        )
+        fts_table.create_fts_index(self.NGRAM_SPEC)
+
+        result = fts_table.search_fts("完全无关词", self.NGRAM_SPEC, top_n=5)
+
+        assert result.num_rows == 0
+
+    def test_multifield_boost_controls_ranking(self, fts_table):
+        spec = FtsSpec((FtsField("title", boost=3.0), FtsField("search_text")), version=2)
+        fts_table.add(
+            pd.DataFrame(
+                {
+                    "id": ["title_hit", "body_hit"],
+                    "title": ["revenue", "other"],
+                    "search_text": ["other", "revenue"],
+                    "category": ["metric", "metric"],
+                }
+            )
+        )
+        fts_table.create_fts_index(spec)
+
+        result = fts_table.search_fts("revenue", spec, top_n=5)
+
+        assert result.column("id").to_pylist() == ["title_hit", "body_hit"]
+        assert result.column("_score")[0].as_py() > result.column("_score")[1].as_py()
+
+    def test_spec_change_reports_version_mismatch(self, fts_table):
+        fts_table.create_fts_index(self.NGRAM_SPEC)
+        changed = FtsSpec((FtsField("search_text", tokenizer="ngram"),), version=2)
+
+        assert fts_table.fts_index_status(changed) == FtsIndexStatus.VERSION_MISMATCH
+
+    def test_legacy_fixed_tsv_index_is_detected_and_removed(self, fts_table):
+        with fts_table._pool.connection() as conn:
+            conn.execute(
+                "ALTER TABLE test_fts ADD COLUMN tsv tsvector "
+                "GENERATED ALWAYS AS (to_tsvector('english', COALESCE(search_text, ''))) STORED"
+            )
+            conn.execute("CREATE INDEX idx_test_fts_fts ON test_fts USING gin (tsv)")
+            conn.commit()
+
+        assert fts_table.fts_index_status(self.NGRAM_SPEC) == FtsIndexStatus.LEGACY
+        assert fts_table.remove_legacy_fts_index() is True
+        assert fts_table.fts_index_status(self.NGRAM_SPEC) == FtsIndexStatus.MISSING
+
+    def test_upsert_and_delete_update_index_without_rebuild(self, fts_table):
+        fts_table.create_fts_index(self.NGRAM_SPEC)
+        fts_table.merge_insert(
+            pd.DataFrame(
+                {
+                    "id": ["orders"],
+                    "title": ["Orders"],
+                    "search_text": ["销售订单"],
+                    "category": ["fact"],
+                }
+            ),
+            "id",
+        )
+        assert fts_table.search_fts("销售订单", self.NGRAM_SPEC, top_n=5).num_rows == 1
+
+        fts_table.merge_insert(
+            pd.DataFrame(
+                {
+                    "id": ["orders"],
+                    "title": ["Orders"],
+                    "search_text": ["退款记录"],
+                    "category": ["fact"],
+                }
+            ),
+            "id",
+        )
+        fts_table.optimize()
+        assert fts_table.search_fts("销售订单", self.NGRAM_SPEC, top_n=5).num_rows == 0
+        assert fts_table.search_fts("退款记录", self.NGRAM_SPEC, top_n=5).num_rows == 1
+
+        fts_table.delete(eq("id", "orders"))
+        assert fts_table.search_fts("退款记录", self.NGRAM_SPEC, top_n=5).num_rows == 0
+
+
 # ==============================================================================
 # Namespace (schema) isolation tests
 # ==============================================================================
 
 
 class TestVectorNamespace:
+    def test_physical_schema_name_preserves_safe_names(self):
+        assert _physical_schema_name("vec_ns_test") == "vec_ns_test"
+
+    def test_physical_schema_name_maps_opaque_names_stably(self):
+        namespace = "Users-kangxue-work-datus-datus-benchmark"
+        physical_name = _physical_schema_name(namespace)
+
+        assert physical_name == _physical_schema_name(namespace)
+        assert len(physical_name) <= 63
+        assert physical_name.startswith("users_kangxue_work_datus_datus_benchmark_")
+        assert physical_name != _physical_schema_name("Users_kangxue_work_datus_datus_benchmark")
+        assert _physical_schema_name("Project") != _physical_schema_name("project")
+
     def test_namespace_creates_schema(self, backend):
         db = backend.connect("vec_ns_test")
         assert db.namespace == "vec_ns_test"
+
+    def test_opaque_namespace_supports_native_fts(self, backend):
+        namespace = "project-with-hyphens"
+        db = backend.connect(namespace)
+        db.drop_table("opaque_fts", ignore_missing=True)
+        table = db.create_table(
+            "opaque_fts",
+            schema=pa.schema([pa.field("id", pa.string()), pa.field("search_text", pa.string())]),
+            unique_columns=["id"],
+        )
+        spec = FtsSpec(fields=(FtsField("search_text", tokenizer="ngram"),))
+        table.add(pd.DataFrame({"id": ["orders"], "search_text": ["销售订单"]}))
+        table.create_fts_index(spec)
+
+        assert db.namespace == namespace
+        assert table.table_name == f"{_physical_schema_name(namespace)}.opaque_fts"
+        assert table.search_fts("销售订单", spec, top_n=5).column("id").to_pylist() == ["orders"]
 
     def test_namespace_qualified_table_name(self, backend, test_schema, embedding_function):
         db = backend.connect("qn_ns")
@@ -779,6 +1018,26 @@ class TestVectorLogicalIsolation:
         logical_table.add(_sample_df(["ex1"]))
         result = logical_table.search_all()
         assert LOGICAL_NAMESPACE_COLUMN not in result.column_names
+
+    def test_fts_search_is_scoped_to_logical_namespace(self, logical_backend):
+        db_a = logical_backend.connect("tenant_a")
+        db_b = logical_backend.connect("tenant_b")
+        _drop_table_raw(db_a.pool, "logical_fts")
+        schema = pa.schema(
+            [
+                pa.field("id", pa.string()),
+                pa.field("search_text", pa.string()),
+            ]
+        )
+        table_a = db_a.create_table("logical_fts", schema=schema, unique_columns=["id"])
+        table_b = db_b.open_table("logical_fts")
+        spec = FtsSpec((FtsField("search_text", tokenizer="ngram"),))
+        table_a.create_fts_index(spec)
+        table_a.merge_insert(pd.DataFrame({"id": ["a"], "search_text": ["销售订单"]}), "id")
+        table_b.merge_insert(pd.DataFrame({"id": ["b"], "search_text": ["销售订单"]}), "id")
+
+        assert table_a.search_fts("销售订单", spec, top_n=5).column("id").to_pylist() == ["a"]
+        assert table_b.search_fts("销售订单", spec, top_n=5).column("id").to_pylist() == ["b"]
 
 
 # ==============================================================================

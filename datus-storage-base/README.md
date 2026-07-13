@@ -6,6 +6,7 @@ This package provides the base classes and registries that all storage adapter i
 
 - `BaseRdbBackend` / `RdbDatabase` / `RdbTable` — relational database abstractions
 - `BaseVectorBackend` / `VectorDatabase` / `VectorTable` — vector database abstractions
+- `FtsField` / `FtsSpec` / `FtsIndexStatus` — backend-independent full-text search contracts
 - `RdbRegistry` / `VectorRegistry` — entry-point-based backend discovery
 - `BackendConfig` — unified backend configuration
 - Condition AST (`eq`, `ne`, `gt`, `and_`, `or_`, …) for portable query filters

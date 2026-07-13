@@ -95,7 +95,7 @@ def _fts_spec_hash(spec: FtsSpec) -> str:
 def _ngram_terms(text: str, min_length: int, max_length: int) -> List[str]:
     """Build deterministic Unicode ngrams while keeping the SQL query bounded."""
 
-    tokens = re.findall(r"\w+", text.lower(), flags=re.UNICODE)
+    tokens = re.findall(r"[^\W_]+", text.lower(), flags=re.UNICODE)
     terms: List[str] = []
     seen: set[str] = set()
     for token in tokens:

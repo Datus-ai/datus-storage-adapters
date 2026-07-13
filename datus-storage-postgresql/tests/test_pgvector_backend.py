@@ -13,6 +13,7 @@ from datus_storage_postgresql.vector.backend import (
     PgvectorBackend,
     PgVectorDb,
     PgVectorTable,
+    _ngram_terms,
     _physical_schema_name,
 )
 
@@ -443,6 +444,21 @@ class TestIndexOperations:
 
 class TestNativeFts:
     NGRAM_SPEC = FtsSpec((FtsField("search_text", tokenizer="ngram"),), version=1)
+
+    def test_ngram_terms_split_identifier_punctuation(self):
+        assert _ngram_terms("Sales_Order-Fact", 2, 2) == [
+            "sa",
+            "al",
+            "le",
+            "es",
+            "or",
+            "rd",
+            "de",
+            "er",
+            "fa",
+            "ac",
+            "ct",
+        ]
 
     def test_database_and_table_report_fts_support(self, db, fts_table):
         assert db.supports_fts() is True

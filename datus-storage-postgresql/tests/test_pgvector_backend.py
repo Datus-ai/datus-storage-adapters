@@ -274,6 +274,7 @@ class TestVectorTableWrite:
         )
         first_timestamp = datetime(2026, 7, 13, 8, 0, tzinfo=timezone.utc)
         second_timestamp = datetime(2026, 7, 13, 9, 0, tzinfo=timezone.utc)
+        third_timestamp = datetime(2026, 7, 13, 10, 0, tzinfo=timezone.utc)
 
         scalar_table.add(
             pd.DataFrame(
@@ -294,10 +295,17 @@ class TestVectorTableWrite:
             ),
             "id",
         )
+        scalar_table.update(
+            eq("id", "scalar-1"),
+            {
+                "updated_at": pa.scalar(third_timestamp, type=pa.timestamp("us", tz="UTC")),
+                "row_count": pa.scalar(3, type=pa.int64()),
+            },
+        )
 
         result = scalar_table.search_all()
-        assert result.column("updated_at")[0].as_py() == second_timestamp.replace(tzinfo=None)
-        assert result.column("row_count")[0].as_py() == 2
+        assert result.column("updated_at")[0].as_py() == third_timestamp.replace(tzinfo=None)
+        assert result.column("row_count")[0].as_py() == 3
 
     def test_delete_str(self, table):
         table.add(_sample_df(["d1", "d2", "d3"], categories=["rm", "keep", "rm"]))

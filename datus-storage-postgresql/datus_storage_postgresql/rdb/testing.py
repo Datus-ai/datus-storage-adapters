@@ -9,6 +9,7 @@ from typing import Any, Dict, Optional
 
 from datus_storage_base.backend_config import LOGICAL_NAMESPACE_COLUMN, IsolationType
 from datus_storage_base.testing import RdbTestEnv, TestEnvConfig
+from datus_storage_postgresql._testcontainers import testcontainer_labels
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +33,7 @@ class PostgresRdbTestEnv(RdbTestEnv):
             username="datus_test",
             password="datus_test",
             dbname="datus_test",
+            labels=testcontainer_labels(),
         )
         self._container.start()
         self._config = {

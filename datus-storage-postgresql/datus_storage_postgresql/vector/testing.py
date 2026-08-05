@@ -11,6 +11,7 @@ from typing import Any, Dict, Optional
 
 from datus_storage_base.backend_config import LOGICAL_NAMESPACE_COLUMN, IsolationType
 from datus_storage_base.testing import TestEnvConfig, VectorTestEnv
+from datus_storage_postgresql._testcontainers import testcontainer_labels
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +37,7 @@ class _SharedContainer:
                     username="datus_test",
                     password="datus_test",
                     dbname="datus_test",
+                    labels=testcontainer_labels(),
                 )
                 cls._container.start()
                 cls._host = cls._container.get_container_host_ip()

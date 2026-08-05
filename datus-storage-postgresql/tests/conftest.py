@@ -4,6 +4,7 @@ import pytest
 from testcontainers.postgres import PostgresContainer
 
 from datus_storage_base.vector.base import EmbeddingFunction
+from datus_storage_postgresql._testcontainers import testcontainer_labels
 
 
 @pytest.fixture(scope="session")
@@ -14,6 +15,7 @@ def pg_container():
         username="testuser",
         password="testpass",
         dbname="testdb",
+        labels=testcontainer_labels(),
     ) as pg:
         yield pg
 

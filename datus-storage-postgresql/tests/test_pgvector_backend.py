@@ -6,6 +6,7 @@ import pandas as pd
 import pyarrow as pa
 import pytest
 from conftest import MockEmbeddingFunction
+from psycopg.errors import UndefinedColumn
 from psycopg_pool import PoolClosed
 
 from datus_storage_base.backend_config import LOGICAL_NAMESPACE_COLUMN
@@ -490,6 +491,94 @@ class TestIndexOperations:
 
     def test_fts_index_multiple_fields(self, table):
         table.create_fts_index(["description", "category"])
+
+
+class TestConcurrentIndexBuilds:
+    """Runtime index builds run CONCURRENTLY so they never lock writers out,
+    which costs them the ability to fail cleanly."""
+
+    @staticmethod
+    def _index_state(table, index_name):
+        schema, _ = table._table_parts()
+        with table._pool.connection() as conn:
+            return conn.execute(
+                "SELECT i.indisvalid, i.indisready FROM pg_index i "
+                "JOIN pg_class c ON c.oid = i.indexrelid "
+                "JOIN pg_namespace n ON n.oid = c.relnamespace "
+                "WHERE n.nspname = %s AND c.relname = %s",
+                (schema, index_name),
+            ).fetchone()
+
+    @staticmethod
+    def _scalar_index_name(table, column):
+        _, bare = table._table_parts()
+        return f"idx_{bare}_{column}_btree"
+
+    @staticmethod
+    def _assert_still_transactional(table):
+        """A connection handed back to the pool must not carry autocommit with it."""
+        with table._pool.connection() as conn:
+            assert conn.autocommit is False
+            conn.execute(f"INSERT INTO {table.table_name} (id) VALUES ('rollback-probe')")
+            conn.rollback()
+        assert table.count_rows(where=eq("id", "rollback-probe")) == 0
+
+    def test_scalar_index_ends_up_valid(self, table):
+        table.add(_sample_df([f"ci{i}" for i in range(5)]))
+        table.create_scalar_index("category")
+
+        state = self._index_state(table, self._scalar_index_name(table, "category"))
+        assert state is not None
+        assert state["indisvalid"] and state["indisready"]
+
+    def test_vector_index_ends_up_valid(self, table):
+        table.add(_sample_df([f"cv{i}" for i in range(5)]))
+        table.create_vector_index("vector", metric="cosine")
+
+        _, bare = table._table_parts()
+        state = self._index_state(table, f"idx_{bare}_vector_hnsw")
+        assert state is not None
+        assert state["indisvalid"] and state["indisready"]
+
+    def test_build_leaves_pooled_connections_transactional(self, table):
+        table.create_scalar_index("category")
+
+        self._assert_still_transactional(table)
+
+    def test_failed_build_leaves_pooled_connections_transactional(self, table):
+        with pytest.raises(UndefinedColumn):
+            table.create_scalar_index("no_such_column")
+
+        self._assert_still_transactional(table)
+
+    def test_index_left_invalid_by_an_interrupted_build_is_replaced(self, table):
+        """An interrupted concurrent build leaves the index in place but invalid.
+        IF NOT EXISTS sees it as present, so without cleanup the table would
+        never get a working index again."""
+        table.add(_sample_df([f"cb{i}" for i in range(5)]))
+        table.create_scalar_index("category")
+        schema, _ = table._table_parts()
+        index_name = self._scalar_index_name(table, "category")
+
+        with table._pool.connection() as conn:
+            conn.execute(
+                "UPDATE pg_index SET indisvalid = false WHERE indexrelid = %s::regclass",
+                (f"{schema}.{index_name}",),
+            )
+            conn.commit()
+        assert self._index_state(table, index_name)["indisvalid"] is False
+
+        table.create_scalar_index("category")
+
+        assert self._index_state(table, index_name)["indisvalid"] is True
+
+    def test_conflict_index_ends_up_valid(self, table):
+        table._ensure_conflict_index(["category"])
+
+        _, bare = table._table_parts()
+        state = self._index_state(table, f"idx_{bare}_category_uq")
+        assert state is not None
+        assert state["indisvalid"] and state["indisready"]
 
 
 class TestNativeFts:

@@ -13,8 +13,10 @@ import json
 import logging
 import re
 import threading
+import time
+from contextlib import contextmanager
 from dataclasses import asdict
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterator, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -38,6 +40,8 @@ _FTS_NGRAM_FUNCTION = "_datus_fts_ngrams"
 _FTS_GENERATED_COLUMN_PREFIX = "_datus_fts_vector_"
 _FTS_BACKEND_VERSION = 1
 _FTS_SCORE_COLUMNS = {"_score", "_relevance_score", "_distance"}
+_INDEX_BUILD_LOCK_INITIAL_RETRY_SECONDS = 0.01
+_INDEX_BUILD_LOCK_MAX_RETRY_SECONDS = 0.5
 
 
 def _validate_identifier(name: str) -> str:
@@ -424,18 +428,23 @@ class PgVectorTable(VectorTable):
 
     def create_vector_index(self, column: str, metric: str = "cosine", **kwargs) -> None:
         _validate_identifier(column)
-        table_token = self._table_name.rsplit(".", 1)[-1]
-        index_name = f"idx_{table_token}_{column}_hnsw"
+        _, table = self._table_parts()
+        index_name = f"idx_{table}_{column}_hnsw"
         ops_map = {
             "cosine": "vector_cosine_ops",
             "l2": "vector_l2_ops",
             "ip": "vector_ip_ops",
         }
         ops = ops_map.get(metric, "vector_cosine_ops")
-        sql = f"CREATE INDEX IF NOT EXISTS {index_name} ON {self._table_name} USING hnsw ({column} {ops})"
-        with self._pool.connection() as conn:
-            conn.execute(sql)
-            conn.commit()
+        self._build_index_concurrently(
+            index_name,
+            psql.SQL("CREATE INDEX CONCURRENTLY IF NOT EXISTS {} ON {} USING hnsw ({} {})").format(
+                psql.Identifier(index_name),
+                self._qualified_table_identifier(),
+                psql.Identifier(column),
+                psql.SQL(ops),
+            ),
+        )
 
     def create_fts_index(self, spec: FtsSpecInput) -> None:
         """Create backend-native indexes for the complete FTS specification."""
@@ -502,17 +511,80 @@ class PgVectorTable(VectorTable):
 
     def create_scalar_index(self, column: str) -> None:
         _validate_identifier(column)
-        table_token = self._table_name.rsplit(".", 1)[-1]
-        index_name = f"idx_{table_token}_{column}_btree"
-        sql = f"CREATE INDEX IF NOT EXISTS {index_name} ON {self._table_name} ({column})"
-        with self._pool.connection() as conn:
-            conn.execute(sql)
-            conn.commit()
+        _, table = self._table_parts()
+        index_name = f"idx_{table}_{column}_btree"
+        self._build_index_concurrently(
+            index_name,
+            psql.SQL("CREATE INDEX CONCURRENTLY IF NOT EXISTS {} ON {} ({})").format(
+                psql.Identifier(index_name),
+                self._qualified_table_identifier(),
+                psql.Identifier(column),
+            ),
+        )
 
     def optimize(self) -> None:
         """PostgreSQL maintains GIN indexes transactionally during DML."""
 
     # -- Private helpers --
+
+    def _build_index_concurrently(self, index_name: str, statement: Any) -> None:
+        """Build an index without holding writers out of the table.
+
+        A plain CREATE INDEX keeps a SHARE lock for the whole build, which
+        conflicts with writers until it finishes. CONCURRENTLY pays two table
+        scans and a wait on in-flight transactions to take a SHARE UPDATE
+        EXCLUSIVE lock instead.
+
+        The trade-off is that an interrupted concurrent build leaves an
+        invalid index behind, which IF NOT EXISTS would then treat as present
+        and skip forever, so any invalid leftover is dropped before retrying.
+        """
+        with self._pool.connection() as conn:
+            previous_autocommit = conn.autocommit
+            # CREATE/DROP INDEX CONCURRENTLY cannot run inside a transaction block.
+            conn.autocommit = True
+            try:
+                with self._index_build_lock(conn, index_name):
+                    self._drop_invalid_index(conn, index_name)
+                    conn.execute(statement)
+            finally:
+                conn.autocommit = previous_autocommit
+
+    @contextmanager
+    def _index_build_lock(self, conn: Any, index_name: str) -> Iterator[None]:
+        """Serialize cleanup and creation for one runtime index name."""
+        schema, table = self._table_parts()
+        lock_key = hashlib.sha256(f"{schema}.{table}:{index_name}".encode("utf-8")).digest()[:8]
+        lock_id = int.from_bytes(lock_key, "big", signed=True)
+        # A blocking pg_advisory_lock() call keeps its transaction open while
+        # waiting. CREATE INDEX CONCURRENTLY can then wait for that transaction
+        # and deadlock with the lock waiter, so retry with short autocommit
+        # transactions instead.
+        retry_delay = _INDEX_BUILD_LOCK_INITIAL_RETRY_SECONDS
+        while not conn.execute("SELECT pg_try_advisory_lock(%s) AS acquired", (lock_id,)).fetchone()["acquired"]:
+            time.sleep(retry_delay)
+            retry_delay = min(retry_delay * 2, _INDEX_BUILD_LOCK_MAX_RETRY_SECONDS)
+        try:
+            yield
+        finally:
+            conn.execute("SELECT pg_advisory_unlock(%s)", (lock_id,))
+
+    def _drop_invalid_index(self, conn: Any, index_name: str) -> None:
+        """Drop the remains of a concurrent build that never completed."""
+        schema, _ = self._table_parts()
+        row = conn.execute(
+            "SELECT 1 FROM pg_index i "
+            "JOIN pg_class c ON c.oid = i.indexrelid "
+            "JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "WHERE n.nspname = %s AND c.relname = %s AND NOT (i.indisvalid AND i.indisready)",
+            (schema, index_name),
+        ).fetchone()
+        if not row:
+            return
+        logger.warning("Dropping invalid index %s.%s left behind by a failed concurrent build", schema, index_name)
+        conn.execute(
+            psql.SQL("DROP INDEX CONCURRENTLY IF EXISTS {}").format(self._qualified_index_identifier(index_name))
+        )
 
     def _table_parts(self) -> tuple[str, str]:
         if "." in self._table_name:
@@ -910,12 +982,16 @@ class PgVectorTable(VectorTable):
             return
         for col in conflict_cols:
             _validate_identifier(col)
-        table_token = self._table_name.rsplit(".", 1)[-1]
-        index_name = f"idx_{table_token}_{'_'.join(conflict_cols)}_uq"
-        cols_sql = ", ".join(conflict_cols)
-        with self._pool.connection() as conn:
-            conn.execute(f"CREATE UNIQUE INDEX IF NOT EXISTS {index_name} ON {self._table_name} ({cols_sql})")
-            conn.commit()
+        _, table = self._table_parts()
+        index_name = f"idx_{table}_{'_'.join(conflict_cols)}_uq"
+        self._build_index_concurrently(
+            index_name,
+            psql.SQL("CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS {} ON {} ({})").format(
+                psql.Identifier(index_name),
+                self._qualified_table_identifier(),
+                psql.SQL(", ").join(psql.Identifier(col) for col in conflict_cols),
+            ),
+        )
         self._ensured_conflict_indexes.add(key)
 
     @property

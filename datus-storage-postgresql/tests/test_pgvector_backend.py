@@ -1,5 +1,7 @@
 """Tests for PgvectorBackend (three-layer architecture)."""
 
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
 import pandas as pd
@@ -571,6 +573,57 @@ class TestConcurrentIndexBuilds:
         table.create_scalar_index("category")
 
         assert self._index_state(table, index_name)["indisvalid"] is True
+
+    def test_same_index_builds_are_serialized(self, table, monkeypatch):
+        """A second caller must not inspect or drop the first caller's in-flight index."""
+        first_in_cleanup = threading.Event()
+        release_first = threading.Event()
+        second_attempted_lock = threading.Event()
+        second_in_cleanup = threading.Event()
+        call_count = 0
+        call_count_lock = threading.Lock()
+
+        original_lock = table._index_build_lock
+        original_drop = table._drop_invalid_index
+
+        def observed_lock(conn, index_name):
+            nonlocal call_count
+            with call_count_lock:
+                call_count += 1
+                if call_count == 2:
+                    second_attempted_lock.set()
+            return original_lock(conn, index_name)
+
+        def controlled_drop(conn, index_name):
+            if not first_in_cleanup.is_set():
+                first_in_cleanup.set()
+                if not release_first.wait(timeout=10):
+                    raise TimeoutError("timed out waiting to release the first index build")
+            else:
+                second_in_cleanup.set()
+            return original_drop(conn, index_name)
+
+        monkeypatch.setattr(table, "_index_build_lock", observed_lock)
+        monkeypatch.setattr(table, "_drop_invalid_index", controlled_drop)
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            first = executor.submit(table.create_scalar_index, "category")
+            assert first_in_cleanup.wait(timeout=10)
+
+            second = executor.submit(table.create_scalar_index, "category")
+            try:
+                assert second_attempted_lock.wait(timeout=10)
+                assert not second_in_cleanup.is_set()
+            finally:
+                release_first.set()
+
+            first.result(timeout=10)
+            second.result(timeout=10)
+
+        assert second_in_cleanup.is_set()
+        state = self._index_state(table, self._scalar_index_name(table, "category"))
+        assert state is not None
+        assert state["indisvalid"] and state["indisready"]
 
     def test_conflict_index_ends_up_valid(self, table):
         table._ensure_conflict_index(["category"])

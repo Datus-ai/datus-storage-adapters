@@ -13,8 +13,10 @@ import json
 import logging
 import re
 import threading
+import time
+from contextlib import contextmanager
 from dataclasses import asdict
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterator, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -38,6 +40,8 @@ _FTS_NGRAM_FUNCTION = "_datus_fts_ngrams"
 _FTS_GENERATED_COLUMN_PREFIX = "_datus_fts_vector_"
 _FTS_BACKEND_VERSION = 1
 _FTS_SCORE_COLUMNS = {"_score", "_relevance_score", "_distance"}
+_INDEX_BUILD_LOCK_INITIAL_RETRY_SECONDS = 0.01
+_INDEX_BUILD_LOCK_MAX_RETRY_SECONDS = 0.5
 
 
 def _validate_identifier(name: str) -> str:
@@ -526,10 +530,10 @@ class PgVectorTable(VectorTable):
     def _build_index_concurrently(self, index_name: str, statement: Any) -> None:
         """Build an index without holding writers out of the table.
 
-        A plain CREATE INDEX keeps an ACCESS EXCLUSIVE lock for the whole
-        build, so every writer stalls until it finishes -- on a large table
-        that is an outage. CONCURRENTLY pays two table scans and a wait on
-        in-flight transactions to take a SHARE UPDATE EXCLUSIVE lock instead.
+        A plain CREATE INDEX keeps a SHARE lock for the whole build, which
+        conflicts with writers until it finishes. CONCURRENTLY pays two table
+        scans and a wait on in-flight transactions to take a SHARE UPDATE
+        EXCLUSIVE lock instead.
 
         The trade-off is that an interrupted concurrent build leaves an
         invalid index behind, which IF NOT EXISTS would then treat as present
@@ -540,10 +544,30 @@ class PgVectorTable(VectorTable):
             # CREATE/DROP INDEX CONCURRENTLY cannot run inside a transaction block.
             conn.autocommit = True
             try:
-                self._drop_invalid_index(conn, index_name)
-                conn.execute(statement)
+                with self._index_build_lock(conn, index_name):
+                    self._drop_invalid_index(conn, index_name)
+                    conn.execute(statement)
             finally:
                 conn.autocommit = previous_autocommit
+
+    @contextmanager
+    def _index_build_lock(self, conn: Any, index_name: str) -> Iterator[None]:
+        """Serialize cleanup and creation for one runtime index name."""
+        schema, table = self._table_parts()
+        lock_key = hashlib.sha256(f"{schema}.{table}:{index_name}".encode("utf-8")).digest()[:8]
+        lock_id = int.from_bytes(lock_key, "big", signed=True)
+        # A blocking pg_advisory_lock() call keeps its transaction open while
+        # waiting. CREATE INDEX CONCURRENTLY can then wait for that transaction
+        # and deadlock with the lock waiter, so retry with short autocommit
+        # transactions instead.
+        retry_delay = _INDEX_BUILD_LOCK_INITIAL_RETRY_SECONDS
+        while not conn.execute("SELECT pg_try_advisory_lock(%s) AS acquired", (lock_id,)).fetchone()["acquired"]:
+            time.sleep(retry_delay)
+            retry_delay = min(retry_delay * 2, _INDEX_BUILD_LOCK_MAX_RETRY_SECONDS)
+        try:
+            yield
+        finally:
+            conn.execute("SELECT pg_advisory_unlock(%s)", (lock_id,))
 
     def _drop_invalid_index(self, conn: Any, index_name: str) -> None:
         """Drop the remains of a concurrent build that never completed."""

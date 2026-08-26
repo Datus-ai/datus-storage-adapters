@@ -1094,11 +1094,14 @@ class PgVectorDb(VectorDatabase):
             self._schema = _physical_schema_name(namespace)
             self._logical_namespace = None
 
-        # Ensure schema exists for non-public namespaces
+        # Ensure schema exists for non-public namespaces. PostgreSQL checks CREATE on the
+        # database *before* IF NOT EXISTS short-circuits, so probing the catalog first is
+        # what keeps an existing namespace reachable for a role that may only read.
         if self._schema != "public":
             with self._pool.connection() as conn:
-                conn.execute(psql.SQL("CREATE SCHEMA IF NOT EXISTS {}").format(psql.Identifier(self._schema)))
-                conn.commit()
+                if not self._schema_exists(conn, self._schema):
+                    conn.execute(psql.SQL("CREATE SCHEMA IF NOT EXISTS {}").format(psql.Identifier(self._schema)))
+                    conn.commit()
 
     @property
     def pool(self) -> ConnectionPool:
@@ -1345,6 +1348,14 @@ class PgVectorDb(VectorDatabase):
               AND a.attnum > 0 AND NOT a.attisdropped
             """,
             (self._schema, table_name, LOGICAL_NAMESPACE_COLUMN),
+        ).fetchone()
+        return row is not None
+
+    @staticmethod
+    def _schema_exists(conn: Any, schema: str) -> bool:
+        row = conn.execute(
+            "SELECT 1 FROM pg_catalog.pg_namespace WHERE nspname = %s",
+            (schema,),
         ).fetchone()
         return row is not None
 

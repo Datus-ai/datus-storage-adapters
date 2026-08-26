@@ -224,6 +224,30 @@ class TestReadOnlyLogicalIsolation:
 
 
 class TestReadOnlyVectorStore:
+    def test_connect_to_an_existing_namespace_emits_no_create_schema(self, pg_config, admin_conn, readonly_config):
+        """`PgVectorDb.__init__` creates the physical namespace schema on every connect."""
+        schema = pa.schema([pa.field("id", pa.string()), pa.field("description", pa.string())])
+        admin_conn.execute("DROP SCHEMA IF EXISTS ro_vec_ns CASCADE")
+        admin_conn.execute("CREATE SCHEMA ro_vec_ns")
+
+        owner = PgvectorBackend()
+        owner.initialize(pg_config)
+        try:
+            owner.connect("ro_vec_ns").create_table("ro_ns_vectors", schema=schema, source_column="description")
+        finally:
+            owner.close()
+        admin_conn.execute("INSERT INTO ro_vec_ns.ro_ns_vectors (id, description) VALUES ('v1', 'hello')")
+        _grant_reads(admin_conn, "ro_vec_ns")
+
+        reader = PgvectorBackend()
+        reader.initialize(readonly_config)
+        try:
+            reader_db = reader.connect("ro_vec_ns")
+            assert reader_db.open_table("ro_ns_vectors", source_column="description").count_rows() == 1
+        finally:
+            reader.close()
+            admin_conn.execute("DROP SCHEMA IF EXISTS ro_vec_ns CASCADE")
+
     def test_open_table_on_an_already_scoped_table(self, pg_config, admin_conn, readonly_config):
         """`open_table` runs the logical-scope migration on every open; it must no-op.
 

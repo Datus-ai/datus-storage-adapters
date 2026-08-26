@@ -12,7 +12,7 @@ from psycopg.errors import UndefinedColumn
 from psycopg_pool import PoolClosed
 
 from datus_storage_base.backend_config import LOGICAL_NAMESPACE_COLUMN
-from datus_storage_base.conditions import and_, eq, not_, or_
+from datus_storage_base.conditions import and_, eq, like, not_, or_
 from datus_storage_base.vector.fts import FtsField, FtsIndexStatus, FtsSpec
 from datus_storage_postgresql.vector.backend import (
     PgvectorBackend,
@@ -310,10 +310,11 @@ class TestVectorTableWrite:
         assert result.column("updated_at")[0].as_py() == third_timestamp.replace(tzinfo=None)
         assert result.column("row_count")[0].as_py() == 3
 
-    def test_delete_str(self, table):
+    def test_delete_rejects_raw_where_string(self, table):
         table.add(_sample_df(["d1", "d2", "d3"], categories=["rm", "keep", "rm"]))
-        table.delete("category = 'rm'")
-        assert table.count_rows() == 1
+        with pytest.raises(TypeError, match="Raw string"):
+            table.delete("category = 'rm'")
+        assert table.count_rows() == 3
 
     def test_delete_where_expr(self, table):
         table.add(_sample_df(["de1", "de2", "de3"], categories=["rm", "keep", "rm"]))
@@ -344,15 +345,18 @@ class TestVectorTableSearch:
         results = table.search_vector(query_text="test", vector_column="vector", top_n=2)
         assert results.num_rows == 2
 
-    def test_search_vector_with_where_str(self, table):
+    def test_search_vector_rejects_raw_where_string(self, table):
+        # Contract: raw SQL where strings are rejected (SQL injection, plus
+        # psycopg re-parses inlined text for placeholders); callers must build
+        # conditions with the AST helpers (eq/like/and_/...).
         table.add(_sample_df(["w1", "w2", "w3"], categories=["alpha", "beta", "alpha"]))
-        results = table.search_vector(
-            query_text="test",
-            vector_column="vector",
-            top_n=10,
-            where="category = 'alpha'",
-        )
-        assert results.num_rows == 2
+        with pytest.raises(TypeError, match="Raw string"):
+            table.search_vector(
+                query_text="test",
+                vector_column="vector",
+                top_n=10,
+                where="category = 'alpha'",
+            )
 
     def test_search_vector_with_where_expr(self, table):
         table.add(_sample_df(["we1", "we2", "we3"], categories=["alpha", "beta", "alpha"]))
@@ -363,6 +367,28 @@ class TestVectorTableSearch:
             where=eq("category", "alpha"),
         )
         assert results.num_rows == 2
+
+    def test_search_vector_with_like_filter(self, table):
+        # Regression: search_vector always executes with parameters (embedding
+        # + LIMIT), so an inlined LIKE pattern's literal '%' used to be
+        # re-parsed by psycopg as placeholder syntax and rejected with
+        # "only '%s', '%b', '%t' are allowed as placeholders".
+        table.add(_sample_df(["lk1", "lk2", "lk3"], categories=["metric", "meta", "doc"]))
+        results = table.search_vector(
+            query_text="test",
+            vector_column="vector",
+            top_n=10,
+            where=like("category", "met*"),
+        )
+        assert results.num_rows == 2
+
+    def test_search_all_with_eq_value_containing_percent(self, table):
+        # A literal '%' inside a plain value must round-trip exactly — it may
+        # neither crash the placeholder parser nor be altered by escaping.
+        table.add(_sample_df(["pct1", "pct2"], categories=["50% off", "full price"]))
+        results = table.search_all(where=eq("category", "50% off"))
+        assert results.num_rows == 1
+        assert results.column("id")[0].as_py() == "pct1"
 
     def test_search_vector_with_select_fields(self, table):
         table.add(_sample_df(["sel1"]))
@@ -397,10 +423,10 @@ class TestVectorTableSearch:
         results = table.search_all()
         assert results.num_rows == 2
 
-    def test_search_all_with_where_str(self, table):
+    def test_search_all_rejects_raw_where_string(self, table):
         table.add(_sample_df(["f1", "f2", "f3"], categories=["keep", "drop", "keep"]))
-        results = table.search_all(where="category = 'keep'")
-        assert results.num_rows == 2
+        with pytest.raises(TypeError, match="Raw string"):
+            table.search_all(where="category = 'keep'")
 
     def test_search_all_with_where_expr(self, table):
         table.add(_sample_df(["fe1", "fe2", "fe3"], categories=["keep", "drop", "keep"]))
@@ -455,9 +481,10 @@ class TestCountRows:
         table.add(_sample_df(["c1", "c2", "c3"]))
         assert table.count_rows() == 3
 
-    def test_count_with_where_str(self, table):
+    def test_count_rejects_raw_where_string(self, table):
         table.add(_sample_df(["cs1", "cs2", "cs3"], categories=["p", "q", "p"]))
-        assert table.count_rows(where="category = 'p'") == 2
+        with pytest.raises(TypeError, match="Raw string"):
+            table.count_rows(where="category = 'p'")
 
     def test_count_with_where_expr(self, table):
         table.add(_sample_df(["ce1", "ce2", "ce3"], categories=["p", "q", "p"]))
@@ -655,6 +682,29 @@ class TestNativeFts:
     def test_database_and_table_report_fts_support(self, db, fts_table):
         assert db.supports_fts() is True
         assert fts_table.supports_fts() is True
+
+    def test_search_fts_with_where_filter(self, fts_table):
+        # search_fts interleaves score/match parameters with the compiled
+        # WHERE's parameters in one statement; a LIKE pattern must ride along
+        # as a bind parameter in placeholder order, not as inlined text that
+        # psycopg would re-parse as a broken placeholder.
+        fts_table.add(
+            pd.DataFrame(
+                {
+                    "id": ["orders", "orders_old", "customers"],
+                    "title": ["Sales orders", "Sales orders (old)", "Customers"],
+                    "search_text": ["sales_order fact current", "sales_order fact archived", "customer dimension"],
+                    "category": ["fact_current", "fact_archived", "dimension"],
+                }
+            )
+        )
+        fts_table.create_fts_index(self.NGRAM_SPEC)
+
+        filtered = fts_table.search_fts("sales order", self.NGRAM_SPEC, top_n=5, where=like("category", "fact*"))
+        assert sorted(filtered.column("id").to_pylist()) == ["orders", "orders_old"]
+
+        exact = fts_table.search_fts("sales order", self.NGRAM_SPEC, top_n=5, where=eq("category", "fact_current"))
+        assert exact.column("id").to_pylist() == ["orders"]
 
     def test_internal_fts_metadata_table_is_hidden(self, db, fts_table):
         fts_table.create_fts_index(self.NGRAM_SPEC)
@@ -1016,6 +1066,21 @@ class TestVectorLogicalIsolation:
         db = logical_backend.connect("tenant_a")
         with pytest.raises(ValueError, match="Table 'missing_logical_vec' not found"):
             db.open_table("missing_logical_vec")
+
+    def test_like_filter_under_logical_namespace(self, logical_table):
+        """Regression for the production crash: the logical-namespace scope
+        adds real %s parameters to every statement, so a LIKE filter whose
+        pattern used to be inlined made psycopg reject the literal '%' as an
+        invalid placeholder. The filter must both execute and scope rows."""
+        logical_table.add(_sample_df(["ll1", "ll2", "ll3"], categories=["metric", "meta", "doc"]))
+        assert logical_table.count_rows(where=like("category", "met*")) == 2
+        results = logical_table.search_all(where=like("category", "met*"))
+        assert results.num_rows == 2
+
+    def test_delete_with_like_filter_under_logical_namespace(self, logical_table):
+        logical_table.add(_sample_df(["ld1", "ld2"], categories=["tmp_a", "keep"]))
+        logical_table.delete(where=like("category", "tmp*"))
+        assert logical_table.count_rows() == 1
 
     def test_unique_columns_scoped_to_logical_namespace(self, logical_backend, test_schema, embedding_function):
         """Fresh logical tables scope unique_columns by backend namespace."""

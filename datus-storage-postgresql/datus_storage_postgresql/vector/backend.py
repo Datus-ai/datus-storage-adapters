@@ -1290,18 +1290,26 @@ class PgVectorDb(VectorDatabase):
         unique_columns: Optional[List[str]] = None,
         migrate_all_unique: bool = False,
     ) -> None:
-        """Ensure an existing logical table has the internal namespace scope."""
+        """Ensure an existing logical table has the internal namespace scope.
+
+        ``open_table`` runs this on every open, including for readers. Each step is
+        therefore gated on a catalog or row probe: an already-scoped table must cost
+        nothing but reads, because a role holding only ``SELECT`` cannot issue even
+        the no-op forms of these statements — PostgreSQL checks ``CREATE`` and table
+        ownership before ``IF NOT EXISTS`` short-circuits.
+        """
         if self._isolation != IsolationType.LOGICAL:
             return
 
         qualified = self._qualified_sql_identifier(table_name)
-        conn.execute(
-            psql.SQL("ALTER TABLE {} ADD COLUMN IF NOT EXISTS {} TEXT NOT NULL DEFAULT ''").format(
-                qualified,
-                psql.Identifier(LOGICAL_NAMESPACE_COLUMN),
+        if not self._namespace_column_exists(conn, table_name):
+            conn.execute(
+                psql.SQL("ALTER TABLE {} ADD COLUMN IF NOT EXISTS {} TEXT NOT NULL DEFAULT ''").format(
+                    qualified,
+                    psql.Identifier(LOGICAL_NAMESPACE_COLUMN),
+                )
             )
-        )
-        if self._logical_namespace is not None:
+        if self._logical_namespace is not None and self._has_unscoped_rows(conn, table_name):
             conn.execute(
                 psql.SQL("UPDATE {} SET {} = %s WHERE {} = ''").format(
                     qualified,
@@ -1317,13 +1325,50 @@ class PgVectorDb(VectorDatabase):
             self._migrate_legacy_unique_scopes(conn, table_name, unique_columns)
 
         idx_name = f"idx_{table_name}_{LOGICAL_NAMESPACE_COLUMN}"
-        conn.execute(
-            psql.SQL("CREATE INDEX IF NOT EXISTS {} ON {} ({})").format(
-                psql.Identifier(idx_name),
-                qualified,
+        if not self._index_exists(conn, idx_name):
+            conn.execute(
+                psql.SQL("CREATE INDEX IF NOT EXISTS {} ON {} ({})").format(
+                    psql.Identifier(idx_name),
+                    qualified,
+                    psql.Identifier(LOGICAL_NAMESPACE_COLUMN),
+                )
+            )
+
+    def _namespace_column_exists(self, conn: Any, table_name: str) -> bool:
+        row = conn.execute(
+            """
+            SELECT 1
+            FROM pg_catalog.pg_attribute a
+            JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
+            JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+            WHERE n.nspname = %s AND c.relname = %s AND a.attname = %s
+              AND a.attnum > 0 AND NOT a.attisdropped
+            """,
+            (self._schema, table_name, LOGICAL_NAMESPACE_COLUMN),
+        ).fetchone()
+        return row is not None
+
+    def _index_exists(self, conn: Any, index_name: str) -> bool:
+        row = conn.execute(
+            """
+            SELECT 1
+            FROM pg_catalog.pg_class c
+            JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+            WHERE n.nspname = %s AND c.relname = %s AND c.relkind = 'i'
+            """,
+            (self._schema, index_name),
+        ).fetchone()
+        return row is not None
+
+    def _has_unscoped_rows(self, conn: Any, table_name: str) -> bool:
+        """Whether any row still carries the empty namespace the ADD COLUMN default leaves."""
+        row = conn.execute(
+            psql.SQL("SELECT 1 FROM {} WHERE {} = '' LIMIT 1").format(
+                self._qualified_sql_identifier(table_name),
                 psql.Identifier(LOGICAL_NAMESPACE_COLUMN),
             )
-        )
+        ).fetchone()
+        return row is not None
 
     def create_table(
         self,

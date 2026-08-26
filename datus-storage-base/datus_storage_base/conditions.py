@@ -248,10 +248,22 @@ def _compile_node(node: Node) -> str:
 
 WhereExpr = Union[Node, None]
 
+_RAW_STRING_ERROR = (
+    "Raw string where clauses are not supported due to SQL injection risk. "
+    "Use condition builders (eq, gt, in_, and_, or_, not_, like) instead."
+)
+
 
 def build_where(where: WhereExpr) -> Optional[str]:
     """
     Compile a structured AST into a SQL-compatible where clause string.
+
+    This renderer inlines values as SQL literals, which is the right choice
+    only for backends that accept a rendered SQL string and offer no
+    parameter binding (LanceDB/DataFusion ``.where(...)``). Backends with a
+    real driver (e.g. PostgreSQL) must use :func:`compile_where_params`
+    instead — splicing this inlined text into a parameterized query makes
+    the driver re-interpret literal ``%`` as placeholder syntax.
 
     Accepts only ``Node`` (Condition/And/Or/Not) or ``None``.
     Raw strings are rejected to prevent SQL injection.
@@ -267,11 +279,104 @@ def build_where(where: WhereExpr) -> Optional[str]:
     if where is None:
         return None
     if isinstance(where, str):
-        raise TypeError(
-            "Raw string where clauses are not supported due to SQL injection risk. "
-            "Use condition builders (eq, gt, in_, and_, or_, not_, like) instead."
-        )
+        raise TypeError(_RAW_STRING_ERROR)
     return _compile_node(where)
+
+
+# ---------- Parameterized compilation ----------
+def _param_value(v: Any) -> Any:
+    """Validate a value bound as a query parameter (parity with _escape_value)."""
+    if isinstance(v, float) and (v != v or v == float("inf") or v == float("-inf")):
+        raise ValueError(f"Cannot use {v!r} as a query parameter")
+    return v
+
+
+def _compile_condition_params(c: Condition) -> tuple:
+    field = _escape_identifier(c.field)
+    op = c.op
+
+    if c.value is None:
+        if op == Op.EQ:
+            return f"{field} IS NULL", []
+        if op == Op.NE:
+            return f"{field} IS NOT NULL", []
+        raise ValueError(f"Operator {op} is invalid with NULL (field: {c.field})")
+
+    if op == Op.IN:
+        if not isinstance(c.value, Iterable) or isinstance(c.value, (str, bytes)):
+            raise TypeError("IN expects a non-string iterable value")
+        values = list(c.value)
+        if not values:
+            return "1 = 0", []
+        non_null_values = [_param_value(v) for v in values if v is not None]
+        include_null = any(v is None for v in values)
+
+        parts = []
+        params: list = []
+        if non_null_values:
+            placeholders = ", ".join(["%s"] * len(non_null_values))
+            parts.append(f"{field} IN ({placeholders})")
+            params.extend(non_null_values)
+        if include_null:
+            parts.append(f"{field} IS NULL")
+        return "(" + " OR ".join(parts) + ")", params
+
+    value = _param_value(c.value)
+    if op == Op.LIKE:
+        return f"{field} LIKE %s ESCAPE '\\'", [value]
+    if op in {Op.EQ, Op.NE, Op.GT, Op.GTE, Op.LT, Op.LTE}:
+        return f"{field} {op.value} %s", [value]
+
+    raise ValueError(f"Unsupported operator: {op}")
+
+
+def _compile_node_params(node: Node) -> tuple:
+    if isinstance(node, Condition):
+        return _compile_condition_params(node)
+    if isinstance(node, (And, Or)):
+        joiner = " AND " if isinstance(node, And) else " OR "
+        empty = "1 = 1" if isinstance(node, And) else "1 = 0"
+        parts = []
+        params: list = []
+        for child in node.nodes:
+            if child is None:
+                continue
+            fragment, child_params = _compile_node_params(child)
+            parts.append(fragment)
+            params.extend(child_params)
+        if not parts:
+            return empty, []
+        return "(" + joiner.join(parts) + ")", params
+    if isinstance(node, Not):
+        inner, params = _compile_node_params(node.node)
+        return f"(NOT {inner})", params
+    raise TypeError(f"Unknown node type: {type(node)}")
+
+
+def compile_where_params(where: WhereExpr) -> tuple:
+    """
+    Compile a structured AST into a DB-API 'format'-style fragment plus parameters.
+
+    Returns ``(fragment, params)`` where ``fragment`` uses ``%s`` placeholders
+    and ``params`` is the positional value list, or ``(None, [])`` for ``None``.
+
+    Counterpart to :func:`build_where` for backends with real parameter
+    binding (e.g. PostgreSQL via psycopg). Values never enter the SQL text,
+    so quoting, literal ``%`` in values or LIKE patterns, and type
+    adaptation are the driver's job rather than string escaping's. ``IN``
+    compiles to native ``field IN (%s, ...)`` (the OR-chain emulation in
+    :func:`build_where` exists only for backends without native ``IN``);
+    ``NULL`` membership still compiles to an ``IS NULL`` alternative.
+
+    Example:
+        compile_where_params(and_(like("name", "Bob*"), eq("ns", "t1")))
+        -> ("(name LIKE %s ESCAPE '\\\\' AND ns = %s)", ["Bob%", "t1"])
+    """
+    if where is None:
+        return None, []
+    if isinstance(where, str):
+        raise TypeError(_RAW_STRING_ERROR)
+    return _compile_node_params(where)
 
 
 # ---------- Convenience Constructors ----------

@@ -26,7 +26,7 @@ from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 
 from datus_storage_base.backend_config import LOGICAL_NAMESPACE_COLUMN, IsolationType
-from datus_storage_base.conditions import WhereExpr, build_where
+from datus_storage_base.conditions import WhereExpr, compile_where_params
 from datus_storage_base.vector.base import BaseVectorBackend, EmbeddingFunction, VectorDatabase, VectorTable
 from datus_storage_base.vector.fts import FtsField, FtsIndexStatus, FtsSpec, FtsSpecInput, normalize_fts_spec
 from datus_storage_postgresql.vector.schema_converter import schema_to_create_table_sql
@@ -214,24 +214,17 @@ class PgVectorTable(VectorTable):
         self._upsert_dataframe(df, on_column)
 
     def delete(self, where: WhereExpr) -> None:
-        if isinstance(where, str):
-            compiled = where
-        else:
-            compiled = build_where(where)
-        combined, ds_params = self._namespace_where_fragment(compiled)
+        combined, ds_params = self._compiled_where(where)
         if combined:
             sql = f"DELETE FROM {self._table_name} WHERE {combined}"
             with self._pool.connection() as conn:
-                conn.execute(sql, ds_params or None)
+                conn.execute(sql, ds_params)
                 conn.commit()
 
     def update(self, where: WhereExpr, values: Dict[str, Any]) -> None:
         if self._isolation == IsolationType.LOGICAL and LOGICAL_NAMESPACE_COLUMN in values:
             raise ValueError(f"{LOGICAL_NAMESPACE_COLUMN} is managed internally and cannot be updated")
-        if isinstance(where, str):
-            compiled = where
-        else:
-            compiled = build_where(where)
+        combined, ds_params = self._compiled_where(where)
         set_parts = []
         params = []
         for col, val in values.items():
@@ -239,7 +232,6 @@ class PgVectorTable(VectorTable):
             set_parts.append(f"{col} = %s")
             params.append(_to_postgres_value(val))
         set_clause = ", ".join(set_parts)
-        combined, ds_params = self._namespace_where_fragment(compiled)
         where_clause = f" WHERE {combined}" if combined else ""
         sql = f"UPDATE {self._table_name} SET {set_clause}{where_clause}"
         with self._pool.connection() as conn:
@@ -292,11 +284,7 @@ class PgVectorTable(VectorTable):
         where: WhereExpr = None,
         select_fields: Optional[List[str]] = None,
     ) -> pa.Table:
-        if isinstance(where, str):
-            compiled = where
-        else:
-            compiled = build_where(where)
-        combined, ds_params = self._namespace_where_fragment(compiled)
+        combined, ds_params = self._compiled_where(where)
         query_embedding = self._compute_query_embedding(query_text)
 
         columns = self._validate_select_fields(select_fields) if select_fields else self._select_columns()
@@ -344,11 +332,7 @@ class PgVectorTable(VectorTable):
         if top_n <= 0:
             return self._empty_fts_result(select_fields)
 
-        if isinstance(where, str):
-            compiled = where
-        else:
-            compiled = build_where(where)
-        combined, namespace_params = self._namespace_where_fragment(compiled)
+        combined, where_params = self._compiled_where(where)
 
         score_parts: List[Any] = []
         score_params: List[Any] = []
@@ -380,7 +364,10 @@ class PgVectorTable(VectorTable):
             table=self._qualified_table_identifier(),
             where_clause=where_sql,
         )
-        params = score_params + namespace_params + match_params + [top_n]
+        # Order mirrors placeholder positions in the composed statement:
+        # SELECT score expressions, then the combined WHERE fragment
+        # (namespace + compiled condition values), then match expressions.
+        params = score_params + where_params + match_params + [top_n]
         with self._pool.connection() as conn:
             rows = conn.execute(query, params).fetchall()
 
@@ -394,11 +381,7 @@ class PgVectorTable(VectorTable):
         select_fields: Optional[List[str]] = None,
         limit: Optional[int] = None,
     ) -> pa.Table:
-        if isinstance(where, str):
-            compiled = where
-        else:
-            compiled = build_where(where)
-        combined, ds_params = self._namespace_where_fragment(compiled)
+        combined, ds_params = self._compiled_where(where)
         columns = self._validate_select_fields(select_fields) if select_fields else self._select_columns()
         where_clause = f"WHERE {combined}" if combined else ""
 
@@ -406,20 +389,16 @@ class PgVectorTable(VectorTable):
         sql = f"SELECT {columns} FROM {self._table_name} {where_clause} {limit_clause}"
 
         with self._pool.connection() as conn:
-            rows = conn.execute(sql, ds_params or None).fetchall()
+            rows = conn.execute(sql, ds_params).fetchall()
 
         return self._rows_to_arrow(rows, select_fields)
 
     def count_rows(self, where: WhereExpr = None) -> int:
-        if isinstance(where, str):
-            compiled = where
-        else:
-            compiled = build_where(where)
-        combined, ds_params = self._namespace_where_fragment(compiled)
+        combined, ds_params = self._compiled_where(where)
         where_clause = f"WHERE {combined}" if combined else ""
         sql = f"SELECT COUNT(*) AS cnt FROM {self._table_name} {where_clause}"
         with self._pool.connection() as conn:
-            row = conn.execute(sql, ds_params or None).fetchone()
+            row = conn.execute(sql, ds_params).fetchone()
             if isinstance(row, dict):
                 return row["cnt"]
             return row[0] if row else 0
@@ -824,18 +803,27 @@ class PgVectorTable(VectorTable):
         arrays["_score"] = pa.array([], type=pa.float64())
         return pa.table(arrays)
 
-    def _namespace_where_fragment(self, existing_compiled: Optional[str] = None) -> tuple:
-        """Build WHERE clause fragment with backend namespace for logical isolation.
+    def _compiled_where(self, where: WhereExpr) -> tuple:
+        """Compile ``where`` and merge the logical-namespace scope, parameterized.
 
-        Returns:
-            (clause_str, params_list) where clause_str may be empty and params
-            is a list of bind values for %s placeholders.
+        Returns ``(clause, params)``: ``clause`` uses ``%s`` placeholders (may
+        be empty) and ``params`` matches the placeholders' textual order —
+        namespace first, then the compiled condition's values.
+
+        The condition AST compiles with values as bind parameters, never as
+        inlined literals: every statement here executes with a parameter
+        list, and psycopg then treats each ``%`` in the SQL text as
+        placeholder syntax — an inlined LIKE pattern or a value containing
+        ``%`` would be rejected as an invalid placeholder. Raw string
+        ``where`` clauses are rejected by ``compile_where_params`` for the
+        same reason, plus SQL injection.
         """
+        fragment, where_params = compile_where_params(where)
         if self._isolation != IsolationType.LOGICAL or self._logical_namespace is None:
-            return (existing_compiled or "", [])
+            return (fragment or "", list(where_params))
         namespace_cond = f"{LOGICAL_NAMESPACE_COLUMN} = %s"
-        if existing_compiled:
-            return (f"{namespace_cond} AND ({existing_compiled})", [self._logical_namespace])
+        if fragment:
+            return (f"{namespace_cond} AND ({fragment})", [self._logical_namespace, *where_params])
         return (namespace_cond, [self._logical_namespace])
 
     def _inject_namespace_df(self, df: pd.DataFrame) -> pd.DataFrame:

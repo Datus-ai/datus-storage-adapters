@@ -13,7 +13,7 @@ import logging
 import re
 import threading
 from contextlib import contextmanager
-from typing import Any, Dict, Iterator, List, Optional, Type
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Type
 
 from psycopg import sql as psql
 from psycopg.rows import dict_row
@@ -364,11 +364,14 @@ class PgRdbDatabase(RdbDatabase):
             self._schema = _validate_identifier(namespace) if namespace else "public"
             self._logical_namespace = None
 
-        # Ensure schema exists for non-public namespaces
+        # Ensure schema exists for non-public namespaces. PostgreSQL checks CREATE on the
+        # database *before* IF NOT EXISTS short-circuits, so probing the catalog first is
+        # what keeps an existing namespace reachable for a role that may only read.
         if self._schema != "public":
             with self._pool.connection() as conn:
-                conn.execute(psql.SQL("CREATE SCHEMA IF NOT EXISTS {}").format(psql.Identifier(self._schema)))
-                conn.commit()
+                if not self._schema_exists(conn, self._schema):
+                    conn.execute(psql.SQL("CREATE SCHEMA IF NOT EXISTS {}").format(psql.Identifier(self._schema)))
+                    conn.commit()
 
     @property
     def pool(self) -> ConnectionPool:
@@ -384,6 +387,145 @@ class PgRdbDatabase(RdbDatabase):
         if self._schema == "public":
             return table_name
         return f"{self._schema}.{table_name}"
+
+    @staticmethod
+    def _scalar(row: Any) -> Any:
+        """First column of a row, whatever row factory the pool was built with."""
+        if row is None:
+            return None
+        if isinstance(row, dict):
+            return next(iter(row.values()), None)
+        return row[0]
+
+    @staticmethod
+    def _schema_exists(conn: Any, schema: str) -> bool:
+        row = conn.execute(
+            "SELECT 1 FROM pg_catalog.pg_namespace WHERE nspname = %s",
+            (schema,),
+        ).fetchone()
+        return row is not None
+
+    def _table_identity(self, conn: Any, table_name: str) -> Optional[tuple]:
+        """``(oid, schema)`` of the table the DDL would target, or None.
+
+        Resolved with ``to_regclass`` on the very string ``_generate_ddl`` emits, so
+        PostgreSQL applies its own rules rather than us re-implementing them: an
+        unquoted name folds to lower case (``RoCaseItems`` is stored ``rocaseitems``),
+        every identifier truncates at NAMEDATALEN, and for the unqualified form this
+        code uses under ``public`` the ``search_path`` decides which schema wins —
+        exactly as it does for the ``CREATE TABLE`` and ``ON <table>`` references
+        being guarded.
+
+        The schema travels back with the oid because the index probes have to be
+        pinned to wherever the table actually resolved; see ``_resolve_relations``.
+
+        The relkind filter stays: a relation of some other kind under that name makes
+        ``CREATE TABLE IF NOT EXISTS`` a no-op but leaves us with an unusable handle,
+        so it is better to emit the DDL and fail loudly on the statement after it.
+        """
+        row = conn.execute(
+            """
+            SELECT c.oid, n.nspname
+            FROM pg_catalog.pg_class c
+            JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+            WHERE c.oid = to_regclass(%s) AND c.relkind IN ('r', 'p', 'f')
+            """,
+            (self._qualified(table_name),),
+        ).fetchone()
+        if row is None:
+            return None
+        if isinstance(row, dict):
+            return row["oid"], row["nspname"]
+        return row[0], row[1]
+
+    @staticmethod
+    def _existing_column_names(conn: Any, table_oid: int) -> set:
+        rows = conn.execute(
+            "SELECT attname FROM pg_catalog.pg_attribute WHERE attrelid = %s AND attnum > 0 AND NOT attisdropped",
+            (table_oid,),
+        ).fetchall()
+        return {r["attname"] if isinstance(r, dict) else r[0] for r in rows}
+
+    def _resolve_relations(self, conn: Any, names: Iterable[str], schema: str) -> set:
+        """Which of ``names`` already exist as a relation in ``schema``.
+
+        Pinned to the schema the target table resolved into, not to ``search_path``:
+        ``CREATE INDEX name ON <table>`` creates and tests ``name`` in the table's
+        schema, so an unrelated relation of the same name in an earlier ``search_path``
+        entry is a different object. Mistaking it for this index would silently skip a
+        unique index and surface much later as a uniqueness or upsert failure.
+
+        The name itself is interpolated unquoted, the way ``_generate_ddl`` emits it,
+        so the server still applies its own folding and truncation. It has passed
+        ``_validate_identifier`` by this point.
+
+        Deliberately unfiltered by relkind, because that is what the guarded statement
+        tests: ``CREATE INDEX IF NOT EXISTS`` skips when *a relation with the same
+        name* exists, whatever kind it is — a partitioned table's parent index
+        included, which is stored as relkind ``I`` rather than ``i``.
+        """
+        wanted = list(dict.fromkeys(names))
+        if not wanted:
+            return set()
+        rows = conn.execute(
+            "SELECT n FROM unnest(%s::text[]) AS n WHERE to_regclass(quote_ident(%s) || '.' || n) IS NOT NULL",
+            (wanted, schema),
+        ).fetchall()
+        return {r["n"] if isinstance(r, dict) else r[0] for r in rows}
+
+    def _pending_ddl_reasons(
+        self,
+        table_def: TableDefinition,
+        legacy_unique_specs: List[tuple[str, List[str], List[str]]],
+    ) -> List[str]:
+        """What ``ensure_table``'s DDL still has to do; empty means every statement is a no-op.
+
+        Worth the round trip because ``IF NOT EXISTS`` is not a privilege waiver:
+        PostgreSQL checks schema-level ``CREATE`` before it short-circuits, so a role
+        holding only ``SELECT`` cannot issue even the DDL that would change nothing.
+        The probe reads ``pg_catalog``, which is world-readable, so it needs no
+        privileges of its own — and unlike ``information_schema`` it is not filtered
+        down to the objects the caller happens to hold a privilege on.
+
+        The reasons double as the diagnosis when the DDL then fails, so the error
+        names what was actually missing instead of always blaming the table.
+        """
+        with self._pool.connection() as conn:
+            identity = self._table_identity(conn, table_def.table_name)
+            if identity is None:
+                return [f"table '{table_def.table_name}' does not exist"]
+            table_oid, table_schema = identity
+
+            reasons: List[str] = []
+            required_indexes = {idx.name for idx in table_def.indices}
+            if self._isolation == IsolationType.LOGICAL:
+                # _migrate_legacy_unique_scopes skips specs already carrying the namespace.
+                pending = [spec for spec in legacy_unique_specs if LOGICAL_NAMESPACE_COLUMN not in spec[1]]
+                required_indexes.update(name for name, _, _ in pending)
+                reasons.extend(self._pending_logical_scope_reasons(conn, table_def.table_name, table_oid, pending))
+
+            existing = self._resolve_relations(conn, required_indexes, table_schema)
+            missing_indexes = sorted(required_indexes - existing)
+            reasons.extend(f"index '{name}' does not exist" for name in missing_indexes)
+            return reasons
+
+    def _pending_logical_scope_reasons(
+        self,
+        conn: Any,
+        table_name: str,
+        table_oid: int,
+        pending_specs: List[tuple[str, List[str], List[str]]],
+    ) -> List[str]:
+        """Logical-isolation work an existing table may still need."""
+        reasons: List[str] = []
+        if LOGICAL_NAMESPACE_COLUMN not in self._existing_column_names(conn, table_oid):
+            reasons.append(f"column '{LOGICAL_NAMESPACE_COLUMN}' does not exist")
+        for _, old_columns, _ in pending_specs:
+            if self._find_legacy_unique_constraints(conn, table_name, old_columns) or self._find_legacy_unique_indexes(
+                conn, table_name, old_columns
+            ):
+                reasons.append(f"unique key on ({', '.join(old_columns)}) is not namespace-scoped")
+        return reasons
 
     @staticmethod
     def _generate_ddl(qualified_name: str, table_def: TableDefinition) -> List[str]:
@@ -562,19 +704,24 @@ class PgRdbDatabase(RdbDatabase):
                 f"ALTER TABLE {qualified} ADD COLUMN IF NOT EXISTS {LOGICAL_NAMESPACE_COLUMN} TEXT NOT NULL DEFAULT ''",
             )
 
-        try:
-            with self._pool.connection() as conn:
-                for stmt in ddl_statements:
-                    conn.execute(stmt)
-                    if self._isolation == IsolationType.LOGICAL and stmt.startswith("ALTER TABLE"):
-                        self._migrate_legacy_unique_scopes(conn, table_def.table_name, legacy_unique_specs)
-                conn.commit()
-        except Exception as e:
-            ddl_text = "\n".join(ddl_statements)
-            logger.exception("Auto-create table '%s' failed", table_def.table_name)
-            raise RuntimeError(
-                f"Failed to create table '{table_def.table_name}'. Please create it manually:\n\n{ddl_text}"
-            ) from e
+        pending = self._pending_ddl_reasons(table_def, legacy_unique_specs)
+        if not pending:
+            logger.debug("Table '%s' is already current; skipping DDL", table_def.table_name)
+        else:
+            try:
+                with self._pool.connection() as conn:
+                    for stmt in ddl_statements:
+                        conn.execute(stmt)
+                        if self._isolation == IsolationType.LOGICAL and stmt.startswith("ALTER TABLE"):
+                            self._migrate_legacy_unique_scopes(conn, table_def.table_name, legacy_unique_specs)
+                    conn.commit()
+            except Exception as e:
+                ddl_text = "\n".join(ddl_statements)
+                logger.exception("Auto-create table '%s' failed", table_def.table_name)
+                raise RuntimeError(
+                    f"Failed to bring table '{table_def.table_name}' up to date ({'; '.join(pending)}). "
+                    f"Apply these manually:\n\n{ddl_text}"
+                ) from e
 
         pk_column = "id"
         for col in table_def.columns:

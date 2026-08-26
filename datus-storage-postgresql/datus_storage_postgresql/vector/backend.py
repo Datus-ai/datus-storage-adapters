@@ -1082,11 +1082,14 @@ class PgVectorDb(VectorDatabase):
             self._schema = _physical_schema_name(namespace)
             self._logical_namespace = None
 
-        # Ensure schema exists for non-public namespaces
+        # Ensure schema exists for non-public namespaces. PostgreSQL checks CREATE on the
+        # database *before* IF NOT EXISTS short-circuits, so probing the catalog first is
+        # what keeps an existing namespace reachable for a role that may only read.
         if self._schema != "public":
             with self._pool.connection() as conn:
-                conn.execute(psql.SQL("CREATE SCHEMA IF NOT EXISTS {}").format(psql.Identifier(self._schema)))
-                conn.commit()
+                if not self._schema_exists(conn, self._schema):
+                    conn.execute(psql.SQL("CREATE SCHEMA IF NOT EXISTS {}").format(psql.Identifier(self._schema)))
+                    conn.commit()
 
     @property
     def pool(self) -> ConnectionPool:
@@ -1278,18 +1281,29 @@ class PgVectorDb(VectorDatabase):
         unique_columns: Optional[List[str]] = None,
         migrate_all_unique: bool = False,
     ) -> None:
-        """Ensure an existing logical table has the internal namespace scope."""
+        """Ensure an existing logical table has the internal namespace scope.
+
+        ``open_table`` runs this on every open, including for readers. Each step is
+        therefore gated on a catalog or row probe: an already-scoped table must cost
+        nothing but reads, because a role holding only ``SELECT`` cannot issue even
+        the no-op forms of these statements — PostgreSQL checks ``CREATE`` and table
+        ownership before ``IF NOT EXISTS`` short-circuits.
+        """
         if self._isolation != IsolationType.LOGICAL:
             return
 
         qualified = self._qualified_sql_identifier(table_name)
-        conn.execute(
-            psql.SQL("ALTER TABLE {} ADD COLUMN IF NOT EXISTS {} TEXT NOT NULL DEFAULT ''").format(
-                qualified,
-                psql.Identifier(LOGICAL_NAMESPACE_COLUMN),
+        # A table that does not resolve leaves oid None, so the statements below run
+        # and fail loudly instead of being silently skipped.
+        table_oid, table_schema = self._table_identity(conn, table_name) or (None, self._schema)
+        if table_oid is None or not self._namespace_column_exists(conn, table_oid):
+            conn.execute(
+                psql.SQL("ALTER TABLE {} ADD COLUMN IF NOT EXISTS {} TEXT NOT NULL DEFAULT ''").format(
+                    qualified,
+                    psql.Identifier(LOGICAL_NAMESPACE_COLUMN),
+                )
             )
-        )
-        if self._logical_namespace is not None:
+        if self._logical_namespace is not None and self._has_unscoped_rows(conn, table_name):
             conn.execute(
                 psql.SQL("UPDATE {} SET {} = %s WHERE {} = ''").format(
                     qualified,
@@ -1305,13 +1319,84 @@ class PgVectorDb(VectorDatabase):
             self._migrate_legacy_unique_scopes(conn, table_name, unique_columns)
 
         idx_name = f"idx_{table_name}_{LOGICAL_NAMESPACE_COLUMN}"
-        conn.execute(
-            psql.SQL("CREATE INDEX IF NOT EXISTS {} ON {} ({})").format(
-                psql.Identifier(idx_name),
-                qualified,
+        if not self._index_exists(conn, table_schema, idx_name):
+            conn.execute(
+                psql.SQL("CREATE INDEX IF NOT EXISTS {} ON {} ({})").format(
+                    psql.Identifier(idx_name),
+                    qualified,
+                    psql.Identifier(LOGICAL_NAMESPACE_COLUMN),
+                )
+            )
+
+    @staticmethod
+    def _schema_exists(conn: Any, schema: str) -> bool:
+        row = conn.execute(
+            "SELECT 1 FROM pg_catalog.pg_namespace WHERE nspname = %s",
+            (schema,),
+        ).fetchone()
+        return row is not None
+
+    def _table_identity(self, conn: Any, table_name: str) -> Optional[tuple]:
+        """``(oid, schema)`` of the table these statements target, spelled as they spell it.
+
+        ``_qualified_sql_identifier`` quotes, and leaves the name unqualified under
+        ``public`` — so ``search_path`` picks the same relation the ALTER / CREATE INDEX
+        would touch. Quoting means nothing folds, but every identifier is still
+        truncated at NAMEDATALEN, which a generated name such as
+        ``idx_<table>__datus_namespace`` can cross; ``to_regclass`` truncates at parse
+        time exactly as those statements do.
+        """
+        row = conn.execute(
+            """
+            SELECT c.oid, n.nspname
+            FROM pg_catalog.pg_class c
+            JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+            WHERE c.oid = to_regclass(%s)
+            """,
+            (self._qualified_sql_identifier(table_name).as_string(conn),),
+        ).fetchone()
+        if row is None:
+            return None
+        if isinstance(row, dict):
+            return row["oid"], row["nspname"]
+        return row[0], row[1]
+
+    @staticmethod
+    def _namespace_column_exists(conn: Any, table_oid: int) -> bool:
+        row = conn.execute(
+            "SELECT 1 FROM pg_catalog.pg_attribute "
+            "WHERE attrelid = %s AND attname = %s AND attnum > 0 AND NOT attisdropped",
+            (table_oid, LOGICAL_NAMESPACE_COLUMN),
+        ).fetchone()
+        return row is not None
+
+    @staticmethod
+    def _index_exists(conn: Any, schema: str, index_name: str) -> bool:
+        """Pinned to the table's own schema, not ``search_path``.
+
+        ``CREATE INDEX name ON <table>`` creates and tests ``name`` where the table
+        lives, so a same-named relation in an earlier ``search_path`` entry is a
+        different object. Unfiltered by relkind, because the guarded statement skips
+        when *a relation* of that name exists — a partitioned parent index (relkind
+        ``I``) included.
+        """
+        row = conn.execute(
+            "SELECT to_regclass(quote_ident(%s) || '.' || quote_ident(%s)) IS NOT NULL",
+            (schema, index_name),
+        ).fetchone()
+        if row is None:
+            return False
+        return bool(next(iter(row.values()), False) if isinstance(row, dict) else row[0])
+
+    def _has_unscoped_rows(self, conn: Any, table_name: str) -> bool:
+        """Whether any row still carries the empty namespace the ADD COLUMN default leaves."""
+        row = conn.execute(
+            psql.SQL("SELECT 1 FROM {} WHERE {} = '' LIMIT 1").format(
+                self._qualified_sql_identifier(table_name),
                 psql.Identifier(LOGICAL_NAMESPACE_COLUMN),
             )
-        )
+        ).fetchone()
+        return row is not None
 
     def create_table(
         self,

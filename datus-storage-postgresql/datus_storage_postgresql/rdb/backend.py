@@ -13,7 +13,7 @@ import logging
 import re
 import threading
 from contextlib import contextmanager
-from typing import Any, Dict, Iterator, List, Optional, Type
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Type
 
 from psycopg import sql as psql
 from psycopg.rows import dict_row
@@ -406,14 +406,25 @@ class PgRdbDatabase(RdbDatabase):
         return row is not None
 
     def _table_oid(self, conn: Any, table_name: str) -> Optional[int]:
+        """OID of the table the DDL would target, or None.
+
+        Resolved with ``to_regclass`` on the very string ``_generate_ddl`` emits, so
+        PostgreSQL applies its own identifier rules: unquoted names fold to lower case
+        and every identifier is truncated at NAMEDATALEN. Comparing the Python string
+        against ``pg_class.relname`` instead would report ``RoCaseItems`` (stored as
+        ``rocaseitems``) as missing and re-emit the DDL this method exists to avoid.
+
+        The relkind filter stays: a relation of some other kind under that name makes
+        ``CREATE TABLE IF NOT EXISTS`` a no-op but leaves us with an unusable handle,
+        so it is better to emit the DDL and fail loudly on the statement after it.
+        """
         row = conn.execute(
             """
             SELECT c.oid
             FROM pg_catalog.pg_class c
-            JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-            WHERE n.nspname = %s AND c.relname = %s AND c.relkind IN ('r', 'p', 'f')
+            WHERE c.oid = to_regclass(%s) AND c.relkind IN ('r', 'p', 'f')
             """,
-            (self._schema, table_name),
+            (self._qualified(table_name),),
         ).fetchone()
         return self._scalar(row)
 
@@ -425,18 +436,26 @@ class PgRdbDatabase(RdbDatabase):
         ).fetchall()
         return {r["attname"] if isinstance(r, dict) else r[0] for r in rows}
 
-    def _existing_index_names(self, conn: Any) -> set:
-        """Index names in this schema — the namespace CREATE INDEX IF NOT EXISTS tests."""
+    def _resolve_relations(self, conn: Any, names: Iterable[str]) -> set:
+        """Which of ``names`` PostgreSQL already resolves to a relation in this schema.
+
+        Resolution goes through ``to_regclass`` for the same reason ``_table_oid`` does
+        — the server, not us, decides how an identifier folds and where it truncates.
+
+        Deliberately unfiltered by relkind, because that is what the statement being
+        guarded tests: ``CREATE INDEX IF NOT EXISTS`` skips when *a relation with the
+        same name* exists, whatever kind it is. It also means a partitioned table's
+        parent index, stored as relkind ``I`` rather than ``i``, counts.
+        """
+        wanted = {name: self._qualified(name) for name in names}
+        if not wanted:
+            return set()
         rows = conn.execute(
-            """
-            SELECT c.relname
-            FROM pg_catalog.pg_class c
-            JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-            WHERE n.nspname = %s AND c.relkind = 'i'
-            """,
-            (self._schema,),
+            "SELECT n FROM unnest(%s::text[]) AS n WHERE to_regclass(n) IS NOT NULL",
+            (list(wanted.values()),),
         ).fetchall()
-        return {r["relname"] if isinstance(r, dict) else r[0] for r in rows}
+        found = {r["n"] if isinstance(r, dict) else r[0] for r in rows}
+        return {name for name, qualified in wanted.items() if qualified in found}
 
     def _pending_ddl_reasons(
         self,
@@ -468,7 +487,7 @@ class PgRdbDatabase(RdbDatabase):
                 required_indexes.update(name for name, _, _ in pending)
                 reasons.extend(self._pending_logical_scope_reasons(conn, table_def.table_name, table_oid, pending))
 
-            missing_indexes = sorted(required_indexes - self._existing_index_names(conn))
+            missing_indexes = sorted(required_indexes - self._resolve_relations(conn, required_indexes))
             reasons.extend(f"index '{name}' does not exist" for name in missing_indexes)
             return reasons
 

@@ -1337,17 +1337,31 @@ class PgVectorDb(VectorDatabase):
                 )
             )
 
-    def _namespace_column_exists(self, conn: Any, table_name: str) -> bool:
+    def _regclass_oid(self, conn: Any, relname: str) -> Optional[int]:
+        """OID of ``relname`` in this schema, spelled the way the guarded DDL spells it.
+
+        The statements here quote their identifiers, so nothing folds — but every
+        identifier is still truncated at NAMEDATALEN, and a generated name such as
+        ``idx_<table>__datus_namespace`` can cross it. ``to_regclass`` truncates at
+        parse time exactly as ``CREATE``/``ALTER`` do, so an existing object is not
+        reported as missing.
+        """
         row = conn.execute(
-            """
-            SELECT 1
-            FROM pg_catalog.pg_attribute a
-            JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
-            JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-            WHERE n.nspname = %s AND c.relname = %s AND a.attname = %s
-              AND a.attnum > 0 AND NOT a.attisdropped
-            """,
-            (self._schema, table_name, LOGICAL_NAMESPACE_COLUMN),
+            "SELECT to_regclass(quote_ident(%s) || '.' || quote_ident(%s))::oid",
+            (self._schema, relname),
+        ).fetchone()
+        if row is None:
+            return None
+        return next(iter(row.values()), None) if isinstance(row, dict) else row[0]
+
+    def _namespace_column_exists(self, conn: Any, table_name: str) -> bool:
+        table_oid = self._regclass_oid(conn, table_name)
+        if table_oid is None:
+            return False
+        row = conn.execute(
+            "SELECT 1 FROM pg_catalog.pg_attribute "
+            "WHERE attrelid = %s AND attname = %s AND attnum > 0 AND NOT attisdropped",
+            (table_oid, LOGICAL_NAMESPACE_COLUMN),
         ).fetchone()
         return row is not None
 
@@ -1360,16 +1374,9 @@ class PgVectorDb(VectorDatabase):
         return row is not None
 
     def _index_exists(self, conn: Any, index_name: str) -> bool:
-        row = conn.execute(
-            """
-            SELECT 1
-            FROM pg_catalog.pg_class c
-            JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-            WHERE n.nspname = %s AND c.relname = %s AND c.relkind = 'i'
-            """,
-            (self._schema, index_name),
-        ).fetchone()
-        return row is not None
+        """Unfiltered by relkind: ``CREATE INDEX IF NOT EXISTS`` skips when *a relation*
+        of that name exists, which includes a partitioned parent index (relkind ``I``)."""
+        return self._regclass_oid(conn, index_name) is not None
 
     def _has_unscoped_rows(self, conn: Any, table_name: str) -> bool:
         """Whether any row still carries the empty namespace the ADD COLUMN default leaves."""

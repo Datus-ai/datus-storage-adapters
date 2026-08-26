@@ -86,7 +86,19 @@ def _grant_reads(conn, *schemas: str) -> None:
 
 
 def _drop_table(conn, name: str) -> None:
-    conn.execute(f'DROP TABLE IF EXISTS "{name}" CASCADE')
+    # Unquoted, so it folds exactly like the DDL the RDB backend emits.
+    conn.execute(f"DROP TABLE IF EXISTS {name} CASCADE")
+
+
+def _relkind(conn, relname: str) -> str:
+    """pg_class.relkind of a relation in `public`, by its *stored* name."""
+    row = conn.execute(
+        "SELECT c.relkind FROM pg_catalog.pg_class c "
+        "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+        "WHERE n.nspname = 'public' AND c.relname = %s",
+        (relname,),
+    ).fetchone()
+    return row[0] if row else ""
 
 
 def _assert_no_create_privilege(config) -> None:
@@ -169,6 +181,101 @@ class TestReadOnlyRdbStore:
         ).fetchall()
         assert len(indexes) == 1
         _drop_table(admin_conn, "ro_partial")
+
+    def test_ensure_table_matches_a_folded_mixed_case_name(self, pg_config, admin_conn, readonly_config):
+        """Unquoted DDL folds `RoCaseItems` to `rocaseitems`; the probe has to resolve it the same way."""
+        table_def = _table_def("RoCaseItems")
+        _drop_table(admin_conn, "RoCaseItems")
+
+        owner = PostgresRdbBackend()
+        owner.initialize(pg_config)
+        try:
+            owner_db = owner.connect(namespace="", store_db_name="test")
+            owner_db.ensure_table(table_def).insert(Item(name="folded", datasource_id=""))
+        finally:
+            owner.close()
+        assert _relkind(admin_conn, "rocaseitems") == "r"
+        _grant_reads(admin_conn)
+
+        reader = PostgresRdbBackend()
+        reader.initialize(readonly_config)
+        try:
+            reader_db = reader.connect(namespace="", store_db_name="test")
+            assert [i.name for i in reader_db.ensure_table(table_def).query(Item)] == ["folded"]
+        finally:
+            reader.close()
+            _drop_table(admin_conn, "RoCaseItems")
+
+    def test_ensure_table_matches_an_index_name_past_namedatalen(self, pg_config, admin_conn, readonly_config):
+        """PostgreSQL truncates identifiers at 63 bytes, so the stored name is not the requested one.
+
+        Not hypothetical: `_scoped_unique_index_name` builds
+        `idx_pub_tb_subject_nodes_parent_id_name_datasource_id__datus_namespace_uq`
+        — 73 characters — for the very deployment this PR is about.
+        """
+        long_index = "idx_ro_overlength_" + "n" * 55  # 73 chars, stored as 63
+        assert len(long_index) > 63
+        table_def = TableDefinition(
+            table_name="ro_overlength",
+            columns=[
+                ColumnDef(name="id", col_type="INTEGER", primary_key=True, autoincrement=True),
+                ColumnDef(name="name", col_type="TEXT", nullable=False),
+                ColumnDef(name="datasource_id", col_type="TEXT", default=""),
+            ],
+            indices=[IndexDef(name=long_index, columns=["name"])],
+        )
+        _drop_table(admin_conn, "ro_overlength")
+
+        owner = PostgresRdbBackend()
+        owner.initialize(pg_config)
+        try:
+            owner_db = owner.connect(namespace="", store_db_name="test")
+            owner_db.ensure_table(table_def).insert(Item(name="truncated", datasource_id=""))
+        finally:
+            owner.close()
+        assert _relkind(admin_conn, long_index[:63]) == "i"
+        _grant_reads(admin_conn)
+
+        reader = PostgresRdbBackend()
+        reader.initialize(readonly_config)
+        try:
+            reader_db = reader.connect(namespace="", store_db_name="test")
+            assert [i.name for i in reader_db.ensure_table(table_def).query(Item)] == ["truncated"]
+        finally:
+            reader.close()
+            _drop_table(admin_conn, "ro_overlength")
+
+    def test_ensure_table_matches_a_partitioned_parent_index(self, pg_config, admin_conn, readonly_config):
+        """A partitioned table's parent index is relkind 'I', not 'i'."""
+        table_def = TableDefinition(
+            table_name="ro_part",
+            columns=[
+                ColumnDef(name="id", col_type="INTEGER"),
+                ColumnDef(name="name", col_type="TEXT", nullable=False),
+                ColumnDef(name="datasource_id", col_type="TEXT", default=""),
+            ],
+            indices=[IndexDef(name="idx_ro_part_name", columns=["name", "datasource_id"])],
+        )
+        _drop_table(admin_conn, "ro_part")
+        admin_conn.execute(
+            "CREATE TABLE ro_part (id INTEGER, name TEXT NOT NULL, datasource_id TEXT DEFAULT '') "
+            "PARTITION BY RANGE (id)"
+        )
+        admin_conn.execute("CREATE TABLE ro_part_p1 PARTITION OF ro_part FOR VALUES FROM (0) TO (100)")
+        admin_conn.execute("CREATE INDEX idx_ro_part_name ON ro_part (name, datasource_id)")
+        admin_conn.execute("INSERT INTO ro_part (id, name) VALUES (1, 'partitioned')")
+        assert _relkind(admin_conn, "ro_part") == "p"
+        assert _relkind(admin_conn, "idx_ro_part_name") == "I"
+        _grant_reads(admin_conn)
+
+        reader = PostgresRdbBackend()
+        reader.initialize(readonly_config)
+        try:
+            reader_db = reader.connect(namespace="", store_db_name="test")
+            assert [i.name for i in reader_db.ensure_table(table_def).query(Item)] == ["partitioned"]
+        finally:
+            reader.close()
+            _drop_table(admin_conn, "ro_part")
 
     def test_connect_to_an_existing_namespace_emits_no_create_schema(self, pg_config, admin_conn, readonly_config):
         """`CREATE SCHEMA IF NOT EXISTS` is checked before it short-circuits, too."""

@@ -1305,7 +1305,10 @@ class PgVectorDb(VectorDatabase):
             return
 
         qualified = self._qualified_sql_identifier(table_name)
-        if not self._namespace_column_exists(conn, table_name):
+        # A table that does not resolve leaves oid None, so the statements below run
+        # and fail loudly instead of being silently skipped.
+        table_oid, table_schema = self._table_identity(conn, table_name) or (None, self._schema)
+        if table_oid is None or not self._namespace_column_exists(conn, table_oid):
             conn.execute(
                 psql.SQL("ALTER TABLE {} ADD COLUMN IF NOT EXISTS {} TEXT NOT NULL DEFAULT ''").format(
                     qualified,
@@ -1328,7 +1331,7 @@ class PgVectorDb(VectorDatabase):
             self._migrate_legacy_unique_scopes(conn, table_name, unique_columns)
 
         idx_name = f"idx_{table_name}_{LOGICAL_NAMESPACE_COLUMN}"
-        if not self._index_exists(conn, idx_name):
+        if not self._index_exists(conn, table_schema, idx_name):
             conn.execute(
                 psql.SQL("CREATE INDEX IF NOT EXISTS {} ON {} ({})").format(
                     psql.Identifier(idx_name),
@@ -1336,34 +1339,6 @@ class PgVectorDb(VectorDatabase):
                     psql.Identifier(LOGICAL_NAMESPACE_COLUMN),
                 )
             )
-
-    def _regclass_oid(self, conn: Any, relname: str) -> Optional[int]:
-        """OID of ``relname`` in this schema, spelled the way the guarded DDL spells it.
-
-        The statements here quote their identifiers, so nothing folds — but every
-        identifier is still truncated at NAMEDATALEN, and a generated name such as
-        ``idx_<table>__datus_namespace`` can cross it. ``to_regclass`` truncates at
-        parse time exactly as ``CREATE``/``ALTER`` do, so an existing object is not
-        reported as missing.
-        """
-        row = conn.execute(
-            "SELECT to_regclass(quote_ident(%s) || '.' || quote_ident(%s))::oid",
-            (self._schema, relname),
-        ).fetchone()
-        if row is None:
-            return None
-        return next(iter(row.values()), None) if isinstance(row, dict) else row[0]
-
-    def _namespace_column_exists(self, conn: Any, table_name: str) -> bool:
-        table_oid = self._regclass_oid(conn, table_name)
-        if table_oid is None:
-            return False
-        row = conn.execute(
-            "SELECT 1 FROM pg_catalog.pg_attribute "
-            "WHERE attrelid = %s AND attname = %s AND attnum > 0 AND NOT attisdropped",
-            (table_oid, LOGICAL_NAMESPACE_COLUMN),
-        ).fetchone()
-        return row is not None
 
     @staticmethod
     def _schema_exists(conn: Any, schema: str) -> bool:
@@ -1373,10 +1348,57 @@ class PgVectorDb(VectorDatabase):
         ).fetchone()
         return row is not None
 
-    def _index_exists(self, conn: Any, index_name: str) -> bool:
-        """Unfiltered by relkind: ``CREATE INDEX IF NOT EXISTS`` skips when *a relation*
-        of that name exists, which includes a partitioned parent index (relkind ``I``)."""
-        return self._regclass_oid(conn, index_name) is not None
+    def _table_identity(self, conn: Any, table_name: str) -> Optional[tuple]:
+        """``(oid, schema)`` of the table these statements target, spelled as they spell it.
+
+        ``_qualified_sql_identifier`` quotes, and leaves the name unqualified under
+        ``public`` — so ``search_path`` picks the same relation the ALTER / CREATE INDEX
+        would touch. Quoting means nothing folds, but every identifier is still
+        truncated at NAMEDATALEN, which a generated name such as
+        ``idx_<table>__datus_namespace`` can cross; ``to_regclass`` truncates at parse
+        time exactly as those statements do.
+        """
+        row = conn.execute(
+            """
+            SELECT c.oid, n.nspname
+            FROM pg_catalog.pg_class c
+            JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+            WHERE c.oid = to_regclass(%s)
+            """,
+            (self._qualified_sql_identifier(table_name).as_string(conn),),
+        ).fetchone()
+        if row is None:
+            return None
+        if isinstance(row, dict):
+            return row["oid"], row["nspname"]
+        return row[0], row[1]
+
+    @staticmethod
+    def _namespace_column_exists(conn: Any, table_oid: int) -> bool:
+        row = conn.execute(
+            "SELECT 1 FROM pg_catalog.pg_attribute "
+            "WHERE attrelid = %s AND attname = %s AND attnum > 0 AND NOT attisdropped",
+            (table_oid, LOGICAL_NAMESPACE_COLUMN),
+        ).fetchone()
+        return row is not None
+
+    @staticmethod
+    def _index_exists(conn: Any, schema: str, index_name: str) -> bool:
+        """Pinned to the table's own schema, not ``search_path``.
+
+        ``CREATE INDEX name ON <table>`` creates and tests ``name`` where the table
+        lives, so a same-named relation in an earlier ``search_path`` entry is a
+        different object. Unfiltered by relkind, because the guarded statement skips
+        when *a relation* of that name exists — a partitioned parent index (relkind
+        ``I``) included.
+        """
+        row = conn.execute(
+            "SELECT to_regclass(quote_ident(%s) || '.' || quote_ident(%s)) IS NOT NULL",
+            (schema, index_name),
+        ).fetchone()
+        if row is None:
+            return False
+        return bool(next(iter(row.values()), False) if isinstance(row, dict) else row[0])
 
     def _has_unscoped_rows(self, conn: Any, table_name: str) -> bool:
         """Whether any row still carries the empty namespace the ADD COLUMN default leaves."""

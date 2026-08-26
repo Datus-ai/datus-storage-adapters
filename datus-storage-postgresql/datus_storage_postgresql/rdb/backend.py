@@ -405,14 +405,19 @@ class PgRdbDatabase(RdbDatabase):
         ).fetchone()
         return row is not None
 
-    def _table_oid(self, conn: Any, table_name: str) -> Optional[int]:
-        """OID of the table the DDL would target, or None.
+    def _table_identity(self, conn: Any, table_name: str) -> Optional[tuple]:
+        """``(oid, schema)`` of the table the DDL would target, or None.
 
         Resolved with ``to_regclass`` on the very string ``_generate_ddl`` emits, so
-        PostgreSQL applies its own identifier rules: unquoted names fold to lower case
-        and every identifier is truncated at NAMEDATALEN. Comparing the Python string
-        against ``pg_class.relname`` instead would report ``RoCaseItems`` (stored as
-        ``rocaseitems``) as missing and re-emit the DDL this method exists to avoid.
+        PostgreSQL applies its own rules rather than us re-implementing them: an
+        unquoted name folds to lower case (``RoCaseItems`` is stored ``rocaseitems``),
+        every identifier truncates at NAMEDATALEN, and for the unqualified form this
+        code uses under ``public`` the ``search_path`` decides which schema wins —
+        exactly as it does for the ``CREATE TABLE`` and ``ON <table>`` references
+        being guarded.
+
+        The schema travels back with the oid because the index probes have to be
+        pinned to wherever the table actually resolved; see ``_resolve_relations``.
 
         The relkind filter stays: a relation of some other kind under that name makes
         ``CREATE TABLE IF NOT EXISTS`` a no-op but leaves us with an unusable handle,
@@ -420,13 +425,18 @@ class PgRdbDatabase(RdbDatabase):
         """
         row = conn.execute(
             """
-            SELECT c.oid
+            SELECT c.oid, n.nspname
             FROM pg_catalog.pg_class c
+            JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
             WHERE c.oid = to_regclass(%s) AND c.relkind IN ('r', 'p', 'f')
             """,
             (self._qualified(table_name),),
         ).fetchone()
-        return self._scalar(row)
+        if row is None:
+            return None
+        if isinstance(row, dict):
+            return row["oid"], row["nspname"]
+        return row[0], row[1]
 
     @staticmethod
     def _existing_column_names(conn: Any, table_oid: int) -> set:
@@ -436,26 +446,32 @@ class PgRdbDatabase(RdbDatabase):
         ).fetchall()
         return {r["attname"] if isinstance(r, dict) else r[0] for r in rows}
 
-    def _resolve_relations(self, conn: Any, names: Iterable[str]) -> set:
-        """Which of ``names`` PostgreSQL already resolves to a relation in this schema.
+    def _resolve_relations(self, conn: Any, names: Iterable[str], schema: str) -> set:
+        """Which of ``names`` already exist as a relation in ``schema``.
 
-        Resolution goes through ``to_regclass`` for the same reason ``_table_oid`` does
-        — the server, not us, decides how an identifier folds and where it truncates.
+        Pinned to the schema the target table resolved into, not to ``search_path``:
+        ``CREATE INDEX name ON <table>`` creates and tests ``name`` in the table's
+        schema, so an unrelated relation of the same name in an earlier ``search_path``
+        entry is a different object. Mistaking it for this index would silently skip a
+        unique index and surface much later as a uniqueness or upsert failure.
 
-        Deliberately unfiltered by relkind, because that is what the statement being
-        guarded tests: ``CREATE INDEX IF NOT EXISTS`` skips when *a relation with the
-        same name* exists, whatever kind it is. It also means a partitioned table's
-        parent index, stored as relkind ``I`` rather than ``i``, counts.
+        The name itself is interpolated unquoted, the way ``_generate_ddl`` emits it,
+        so the server still applies its own folding and truncation. It has passed
+        ``_validate_identifier`` by this point.
+
+        Deliberately unfiltered by relkind, because that is what the guarded statement
+        tests: ``CREATE INDEX IF NOT EXISTS`` skips when *a relation with the same
+        name* exists, whatever kind it is — a partitioned table's parent index
+        included, which is stored as relkind ``I`` rather than ``i``.
         """
-        wanted = {name: self._qualified(name) for name in names}
+        wanted = list(dict.fromkeys(names))
         if not wanted:
             return set()
         rows = conn.execute(
-            "SELECT n FROM unnest(%s::text[]) AS n WHERE to_regclass(n) IS NOT NULL",
-            (list(wanted.values()),),
+            "SELECT n FROM unnest(%s::text[]) AS n WHERE to_regclass(quote_ident(%s) || '.' || n) IS NOT NULL",
+            (wanted, schema),
         ).fetchall()
-        found = {r["n"] if isinstance(r, dict) else r[0] for r in rows}
-        return {name for name, qualified in wanted.items() if qualified in found}
+        return {r["n"] if isinstance(r, dict) else r[0] for r in rows}
 
     def _pending_ddl_reasons(
         self,
@@ -475,9 +491,10 @@ class PgRdbDatabase(RdbDatabase):
         names what was actually missing instead of always blaming the table.
         """
         with self._pool.connection() as conn:
-            table_oid = self._table_oid(conn, table_def.table_name)
-            if table_oid is None:
+            identity = self._table_identity(conn, table_def.table_name)
+            if identity is None:
                 return [f"table '{table_def.table_name}' does not exist"]
+            table_oid, table_schema = identity
 
             reasons: List[str] = []
             required_indexes = {idx.name for idx in table_def.indices}
@@ -487,7 +504,8 @@ class PgRdbDatabase(RdbDatabase):
                 required_indexes.update(name for name, _, _ in pending)
                 reasons.extend(self._pending_logical_scope_reasons(conn, table_def.table_name, table_oid, pending))
 
-            missing_indexes = sorted(required_indexes - self._resolve_relations(conn, required_indexes))
+            existing = self._resolve_relations(conn, required_indexes, table_schema)
+            missing_indexes = sorted(required_indexes - existing)
             reasons.extend(f"index '{name}' does not exist" for name in missing_indexes)
             return reasons
 

@@ -90,13 +90,13 @@ def _drop_table(conn, name: str) -> None:
     conn.execute(f"DROP TABLE IF EXISTS {name} CASCADE")
 
 
-def _relkind(conn, relname: str) -> str:
-    """pg_class.relkind of a relation in `public`, by its *stored* name."""
+def _relkind(conn, relname: str, schema: str = "public") -> str:
+    """pg_class.relkind of a relation in `schema`, by its *stored* name."""
     row = conn.execute(
         "SELECT c.relkind FROM pg_catalog.pg_class c "
         "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
-        "WHERE n.nspname = 'public' AND c.relname = %s",
-        (relname,),
+        "WHERE n.nspname = %s AND c.relname = %s",
+        (schema, relname),
     ).fetchone()
     return row[0] if row else ""
 
@@ -276,6 +276,44 @@ class TestReadOnlyRdbStore:
         finally:
             reader.close()
             _drop_table(admin_conn, "ro_part")
+
+    def test_index_probe_is_pinned_to_the_tables_schema_not_the_search_path(self, pg_config, admin_conn):
+        """`CREATE INDEX name ON t` creates and tests `name` in t's schema.
+
+        A same-named relation in a different `search_path` entry is a different object;
+        counting it would silently skip a required unique index and surface much later
+        as a uniqueness or upsert failure.
+
+        The target table sits in `ro_shadow`, which is also where an unqualified
+        `CREATE TABLE` would land under this search path, so the only thing this test
+        varies is where the *index name* is looked up.
+        """
+        table_def = _table_def("ro_probe_target")
+        admin_conn.execute("DROP SCHEMA IF EXISTS ro_shadow CASCADE")
+        _drop_table(admin_conn, "idx_ro_probe_target_name")
+        admin_conn.execute("CREATE SCHEMA ro_shadow")
+        admin_conn.execute(
+            "CREATE TABLE ro_shadow.ro_probe_target "
+            "(id SERIAL PRIMARY KEY, name TEXT NOT NULL, datasource_id TEXT DEFAULT '')"
+        )
+        # A decoy carrying the index's name, in the other schema on the search path.
+        admin_conn.execute("CREATE TABLE public.idx_ro_probe_target_name (x INTEGER)")
+        admin_conn.execute(f"ALTER ROLE {pg_config['user']} SET search_path = ro_shadow, public")
+        try:
+            owner = PostgresRdbBackend()
+            owner.initialize(pg_config)
+            try:
+                owner_db = owner.connect(namespace="", store_db_name="test")
+                # Unqualified, so both the DDL and the probe go through search_path.
+                assert owner_db._qualified("ro_probe_target") == "ro_probe_target"
+                owner_db.ensure_table(table_def)
+            finally:
+                owner.close()
+            assert _relkind(admin_conn, "idx_ro_probe_target_name", "ro_shadow") == "i"
+        finally:
+            admin_conn.execute(f"ALTER ROLE {pg_config['user']} RESET search_path")
+            admin_conn.execute("DROP SCHEMA IF EXISTS ro_shadow CASCADE")
+            _drop_table(admin_conn, "idx_ro_probe_target_name")
 
     def test_connect_to_an_existing_namespace_emits_no_create_schema(self, pg_config, admin_conn, readonly_config):
         """`CREATE SCHEMA IF NOT EXISTS` is checked before it short-circuits, too."""

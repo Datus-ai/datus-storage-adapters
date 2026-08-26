@@ -683,6 +683,29 @@ class TestNativeFts:
         assert db.supports_fts() is True
         assert fts_table.supports_fts() is True
 
+    def test_search_fts_with_where_filter(self, fts_table):
+        # search_fts interleaves score/match parameters with the compiled
+        # WHERE's parameters in one statement; a LIKE pattern must ride along
+        # as a bind parameter in placeholder order, not as inlined text that
+        # psycopg would re-parse as a broken placeholder.
+        fts_table.add(
+            pd.DataFrame(
+                {
+                    "id": ["orders", "orders_old", "customers"],
+                    "title": ["Sales orders", "Sales orders (old)", "Customers"],
+                    "search_text": ["sales_order fact current", "sales_order fact archived", "customer dimension"],
+                    "category": ["fact_current", "fact_archived", "dimension"],
+                }
+            )
+        )
+        fts_table.create_fts_index(self.NGRAM_SPEC)
+
+        filtered = fts_table.search_fts("sales order", self.NGRAM_SPEC, top_n=5, where=like("category", "fact*"))
+        assert sorted(filtered.column("id").to_pylist()) == ["orders", "orders_old"]
+
+        exact = fts_table.search_fts("sales order", self.NGRAM_SPEC, top_n=5, where=eq("category", "fact_current"))
+        assert exact.column("id").to_pylist() == ["orders"]
+
     def test_internal_fts_metadata_table_is_hidden(self, db, fts_table):
         fts_table.create_fts_index(self.NGRAM_SPEC)
         assert "_datus_fts_specs" not in db.table_names()

@@ -283,7 +283,7 @@ jobs:
 
           if [ -e "${PACKAGE_PATH}/tests/unit" ]; then
             echo "=== Unit tests: ${PACKAGE} ==="
-            uv run --all-packages --with pytest pytest "${PACKAGE_PATH}/tests/unit" -m "not integration" --tb=short
+            uv run --all-packages --all-extras pytest "${PACKAGE_PATH}/tests/unit" -m "not integration" --tb=short
           else
             echo "Skipping unit tests: ${PACKAGE_PATH}/tests/unit does not exist"
           fi

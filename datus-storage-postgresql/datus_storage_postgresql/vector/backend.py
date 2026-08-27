@@ -52,13 +52,18 @@ def _validate_identifier(name: str) -> str:
 
 
 def _to_postgres_value(value: Any) -> Any:
-    """Convert dataframe scalar wrappers into values psycopg can adapt."""
+    """Convert dataframe scalar wrappers and missing values for psycopg."""
 
     if isinstance(value, pa.Scalar):
         value = value.as_py()
     if isinstance(value, np.generic):
         value = value.item()
     if value is pd.NA or value is pd.NaT:
+        return None
+    # Mixed object columns use a Python float NaN for missing values. Psycopg
+    # otherwise binds it as float8, which PostgreSQL cannot assign to columns
+    # such as BOOLEAN even though the DataFrame value represents SQL NULL.
+    if isinstance(value, float) and np.isnan(value):
         return None
     if isinstance(value, pd.Timestamp):
         return value.to_pydatetime()

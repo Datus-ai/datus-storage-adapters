@@ -262,6 +262,38 @@ class TestVectorTableWrite:
         result = table.search_all(where=eq("id", "u1"))
         assert result.column("category")[0].as_py() == "updated"
 
+    @pytest.mark.parametrize("write_method", ["add", "merge_insert"])
+    def test_write_converts_dataframe_nan_to_null(self, db, write_method):
+        table_name = f"nullable_boolean_{write_method}"
+        db.drop_table(table_name, ignore_missing=True)
+        nullable_boolean_table = db.create_table(
+            table_name,
+            schema=pa.schema(
+                [
+                    pa.field("id", pa.string()),
+                    pa.field("kind", pa.string()),
+                    pa.field("is_primary_key", pa.bool_()),
+                ]
+            ),
+            unique_columns=["id"],
+        )
+        rows = pd.DataFrame(
+            [
+                {"id": "dataset:orders", "kind": "dataset"},
+                {"id": "field:orders.id", "kind": "field", "is_primary_key": True},
+            ]
+        )
+        assert pd.isna(rows.loc[0, "is_primary_key"])
+
+        if write_method == "add":
+            nullable_boolean_table.add(rows)
+        else:
+            nullable_boolean_table.merge_insert(rows, "id")
+
+        stored = {row["id"]: row for row in nullable_boolean_table.search_all().to_pylist()}
+        assert stored["dataset:orders"]["is_primary_key"] is None
+        assert stored["field:orders.id"]["is_primary_key"] is True
+
     def test_write_operations_convert_dataframe_scalar_wrappers(self, db):
         db.drop_table("scalar_values", ignore_missing=True)
         scalar_table = db.create_table(

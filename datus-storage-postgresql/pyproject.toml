@@ -1,6 +1,6 @@
 [project]
 name = "datus-storage-postgresql"
-version = "0.1.7"
+version = "0.1.8"
 description = "PostgreSQL RDB and pgvector backend adapters for datus-agent"
 requires-python = ">=3.12"
 license = "Apache-2.0"

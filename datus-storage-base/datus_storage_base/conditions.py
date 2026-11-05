@@ -11,14 +11,14 @@ that compile into SQL-compatible `where` clause strings for vector store backend
 
 Why?
 ----
-Vector store backends support SQL-like `where` strings, but may not support `IN`
-and complex nested logical grouping directly. This utility lets you compose
-conditions in Python objects, then compile them safely.
+This utility lets you compose conditions in Python objects, then compile them
+safely for SQL-compatible backends such as LanceDB. Membership uses native `IN`
+so large value lists do not create deeply nested boolean expressions.
 
 Main Features
 -------------
 - Atomic conditions with operators: =, !=, >, >=, <, <=, LIKE
-- Simulated `IN` using OR chains
+- Native `IN` with explicit NULL membership
 - Logical composition with AND, OR, NOT
 - Automatic escaping of field names and values
 - Pythonic factory helpers (eq, gt, in_, and_, or_, not_)
@@ -40,10 +40,10 @@ Example 2: Mixing AND/OR
     >>> build_where(expr)
     "((status = 'active' AND score >= 80) OR (country = 'US' AND age < 30))"
 
-Example 3: IN expansion
+Example 3: IN membership
     >>> expr = in_("type", ["A", "B", "C"])
     >>> build_where(expr)
-    "(type = 'A' OR type = 'B' OR type = 'C')"
+    "(type IN ('A', 'B', 'C'))"
 
 Example 4: Using NOT
     >>> expr = and_(
@@ -76,7 +76,7 @@ class Op(str, Enum):
     GTE = ">="
     LT = "<"
     LTE = "<="
-    IN = "IN"  # Will be expanded into OR chain (not all backends support native IN)
+    IN = "IN"
     LIKE = "LIKE"  # SQL-like semantics with % and _
 
 
@@ -199,7 +199,8 @@ def _compile_condition(c: Condition) -> str:
             return f"{field} IS NOT NULL"
         raise ValueError(f"Operator {op} is invalid with NULL (field: {c.field})")
 
-    # Emulate IN using OR chain
+    # Keep membership native: a long OR chain can overflow the native stack in
+    # LanceDB's deletion path. None remains an explicit IS NULL alternative.
     if op == Op.IN:
         if not isinstance(c.value, Iterable) or isinstance(c.value, (str, bytes)):
             raise TypeError("IN expects a non-string iterable value")
@@ -212,7 +213,8 @@ def _compile_condition(c: Condition) -> str:
 
         parts = []
         if non_null_values:
-            parts.extend(f"{field} = {_escape_value(v)}" for v in non_null_values)
+            literals = ", ".join(_escape_value(v) for v in non_null_values)
+            parts.append(f"{field} IN ({literals})")
         if include_null:
             parts.append(f"{field} IS NULL")
         return "(" + " OR ".join(parts) + ")"
@@ -364,9 +366,8 @@ def compile_where_params(where: WhereExpr) -> tuple:
     binding (e.g. PostgreSQL via psycopg). Values never enter the SQL text,
     so quoting, literal ``%`` in values or LIKE patterns, and type
     adaptation are the driver's job rather than string escaping's. ``IN``
-    compiles to native ``field IN (%s, ...)`` (the OR-chain emulation in
-    :func:`build_where` exists only for backends without native ``IN``);
-    ``NULL`` membership still compiles to an ``IS NULL`` alternative.
+    compiles to native ``field IN (%s, ...)``; both renderers keep ``NULL``
+    membership as an explicit ``IS NULL`` alternative.
 
     Example:
         compile_where_params(and_(like("name", "Bob*"), eq("ns", "t1")))

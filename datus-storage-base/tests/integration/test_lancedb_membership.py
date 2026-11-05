@@ -24,6 +24,7 @@ import datus_storage_base
     ],
 )
 def test_delete_stale_objects_preserves_retained_ids_and_scope(tmp_path, keep_count, expected_extra):
+    """Native cleanup must survive large retained sets and preserve other scopes."""
     script = textwrap.dedent(
         """
         import json

@@ -9,10 +9,12 @@ from datus_storage_base.conditions import build_where, in_, not_
 
 
 def test_membership_uses_native_in_and_escapes_literals():
+    """Quoted identifiers and values remain safe inside native membership."""
     assert build_where(in_("object id", ["a", "O'Hara"])) == "(\"object id\" IN ('a', 'O''Hara'))"
 
 
 def test_large_membership_does_not_create_a_linear_boolean_tree():
+    """Retained-ID lists must not grow the deletion predicate's boolean depth."""
     where = build_where(not_(in_("id", [f"object_{i}" for i in range(2048)])))
     assert "id IN (" in where
     assert " OR " not in where
@@ -30,6 +32,7 @@ def test_large_membership_does_not_create_a_linear_boolean_tree():
     ],
 )
 def test_membership_literals(values, expected):
+    """Render empty, nullable, and typed lists without changing their meaning."""
     assert build_where(in_("id", values)) == expected
 
 
@@ -45,6 +48,7 @@ def test_membership_literals(values, expected):
     ],
 )
 def test_membership_preserves_null_and_negation_semantics(values, positive, negative):
+    """Execute both predicates to verify SQL true, false, and unknown results."""
     with sqlite3.connect(":memory:") as conn:
         conn.execute("CREATE TABLE objects (id TEXT)")
         conn.executemany("INSERT INTO objects VALUES (?)", [(None,), ("a",), ("b",), ("O'Hara",)])
